@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  2-Pyramid 品牌 logo —— 三棱锥线条图（来自 2pyr-logo.svg）
+  在 Compose 里通过 painterResource(R.drawable.ic_pyramid_logo) 使用，
+  也作为 launcher icon 的 foreground（adaptive icon）。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="680dp"
+    android:height="680dp"
+    android:viewportWidth="680"
+    android:viewportHeight="680">
+
+    <!-- 外框三条边（粗 stroke，小尺寸下也清晰） -->
+    <path
+        android:strokeColor="#1A1B1F"
+        android:strokeWidth="7"
+        android:strokeLineCap="round"
+        android:fillColor="#00000000"
+        android:pathData="M260,520 L200,390 M260,520 L500,190 M200,390 L500,190" />
+
+    <!-- 内部分割线 -->
+    <path
+        android:strokeColor="#1A1B1F"
+        android:strokeWidth="5"
+        android:strokeLineCap="round"
+        android:fillColor="#00000000"
+        android:pathData="M260,520 L374,274" />
+</vector>

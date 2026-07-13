@@ -1,0 +1,4 @@
+# 把 D:\Android\Sdk 复制到本文件，并把 sdk.dir / ndk.dir 改成你机器上的路径
+# Android Studio 启动导入时会优先读这里的值，USER_HOME 没设时用它
+sdk.dir=D\:\\Android\\Sdk
+ndk.dir=D\:\\Android\\Sdk\\ndk\\27.0.11718016

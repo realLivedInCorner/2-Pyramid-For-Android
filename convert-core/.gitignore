@@ -1,0 +1,11 @@
+# convert-core — Rust crate for 2-Pyramid Android
+target/
+*.so
+*.a
+*.rlib
+*.d
+*.o
+
+# Personal rustflags config (has hardcoded %USERPROFILE%\Downloads\... path)
+# Re-create manually if you hit the same rustup mirror 404 issue.
+.cargo/config.toml

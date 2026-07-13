@@ -1,0 +1,15 @@
+# 2FA Android Studio project — generated artifacts
+.gradle/
+build/
+local.properties
+
+# IntelliJ / Android Studio
+.idea/
+*.iml
+
+# Output
+app/build/
+captures/
+
+# Native build
+app/src/main/jniLibs/
