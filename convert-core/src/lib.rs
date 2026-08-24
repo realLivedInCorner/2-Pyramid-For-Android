@@ -5,7 +5,7 @@
 //! 暴露给 Kotlin 层调用。
 //!
 //! ## 模块清单
-//! - [`converters`] — 85 个资源包转换模块（正向/反向）
+//! - [`converters`] — 87 个资源包转换模块（正向/反向）
 //! - [`hurray`] — DTD 调度器（Eraser → Architect → Surgeon 三层任务模型）
 //! - [`invoke_conversion`] — 转换流水线入口
 //! - [`image_utils`] / [`color_utils`] — 图像处理工具
@@ -113,10 +113,9 @@ pub fn convert_zip(req: ConvertRequest) -> Result<ConvertReport, ConvertError> {
     if !input_zip.exists() {
         return Err(ConvertError::InputNotFound { path: req.input_zip.clone() });
     }
-    if req.target_version == 1000 {
-        return Err(ConvertError::BedrockNotSupported);
-    }
-
+    // Bedrock Latest（1000）已随桌面版同步实现：先按 Java 1.21.11（75）
+    // 走完整流水线，再执行 Bedrock 结构重组 + manifest.json（.mcpack）。
+    // BedrockNotSupported 变体保留仅为兼容旧 binding，不再主动抛出。
     let output_path = process_zip(
         &req.input_zip,
         req.target_version,

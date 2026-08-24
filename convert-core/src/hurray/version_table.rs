@@ -37,6 +37,7 @@ pub const PACK_FORMAT_LABELS: &[&str] = &[
     "Java 1.21.9-1.21.10", // 69
     "Java 1.21.11",         // 75
     "Java 26.1-26.1.2",    // 84
+    "Java 26.2",          // 88
     "Bedrock Latest",       // 1000
 ];
 
@@ -68,7 +69,8 @@ pub fn pack_format_label(format: u32) -> &'static str {
         69 => PACK_FORMAT_LABELS[21],
         75 => PACK_FORMAT_LABELS[22],
         84 => PACK_FORMAT_LABELS[23],
-        1000 => PACK_FORMAT_LABELS[24],
+        88 => PACK_FORMAT_LABELS[24],
+        1000 => PACK_FORMAT_LABELS[25],
         _ => "Unknown",
     }
 }
@@ -76,7 +78,7 @@ pub fn pack_format_label(format: u32) -> &'static str {
 /// 所有已知 pack_format 列表（用于校验 / UI 列出）
 pub const ALL_PACK_FORMATS: &[u32] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 15, 18, 22, 32,
-    34, 42, 46, 55, 63, 64, 69, 75, 84, 1000,
+    34, 42, 46, 55, 63, 64, 69, 75, 84, 88, 1000,
 ];
 
 /// 完整版本元数据（id, label, abi hint for UI sort）
@@ -121,6 +123,7 @@ pub const ALL_VERSIONS: &[VersionInfo] = &[
     VersionInfo { pack_format: 69,   label: "Java 1.21.9-1.21.10", major_minor: "1.21.9-1.21.10", tier: VersionTier::JavaModern },
     VersionInfo { pack_format: 75,   label: "Java 1.21.11",         major_minor: "1.21.11",    tier: VersionTier::JavaModern },
     VersionInfo { pack_format: 84,   label: "Java 26.1-26.1.2",    major_minor: "26.1-26.1.2", tier: VersionTier::Java26 },
+    VersionInfo { pack_format: 88,   label: "Java 26.2",          major_minor: "26.2",       tier: VersionTier::Java26 },
     VersionInfo { pack_format: 1000, label: "Bedrock Latest",       major_minor: "Bedrock",    tier: VersionTier::Bedrock },
 ];
 
@@ -265,6 +268,13 @@ pub const FORWARD_CHAIN: &[((u32, u32), &[&str])] = &[
     ((75, 84), &[
         // 占位
     ]),
+    // ============ 26.1-26.1.2 → 26.2 (84 → 88) ============
+    ((84, 88), &[
+        // 占位
+    ]),
+    // ============ 26.2 → Bedrock (88 → 1000) ============
+    // 注：原表为 (84, 1000)，新增 88 后保持 84 → 1000 旧路径不变，
+    // 同时若需 88 → 1000 也走原 Bedrock 占位路径
     // ============ 26.1-26.1.2 → Bedrock (84 → 1000) ============
     // 暂未实现 Bedrock 转换（保留作为未来扩展点）
     ((84, 1000), &[
@@ -277,6 +287,8 @@ pub const FORWARD_CHAIN: &[((u32, u32), &[&str])] = &[
 pub const REVERSE_CHAIN: &[((u32, u32), &[&str])] = &[
     // ============ Bedrock → 26.1-26.1.2 (1000 → 84) ============
     ((1000, 84), &[]),
+    // ============ 26.2 → 26.1-26.1.2 (88 → 84) ============
+    ((88, 84), &[]),
     // ============ 26.1-26.1.2 → 1.21.11 (84 → 75) ============
     ((84, 75), &[]),
     // ============ 1.21.11 → 1.21.9-1.21.10 (75 → 69) ============

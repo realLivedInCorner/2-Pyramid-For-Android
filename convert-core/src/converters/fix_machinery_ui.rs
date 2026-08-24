@@ -296,7 +296,7 @@ mod tests {
             "{}/assets/minecraft/textures/gui/container/anvil.png",
             base
         );
-        if !std::path::Path::new(shulker_src).exists() || !std::path::Path::new(anvil_src).exists() {
+        if !std::path::Path::new(&shulker_src).exists() || !std::path::Path::new(&anvil_src).exists() {
             eprintln!("SKIP: Pika 5K shulker_box.png or anvil.png not found");
             return;
         }

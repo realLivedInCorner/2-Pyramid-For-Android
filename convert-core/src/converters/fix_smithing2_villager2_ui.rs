@@ -251,7 +251,7 @@ mod tests {
             std::env::var("PIKA_5K_16X_PATH")
                 .unwrap_or_else(|_| String::from("/path/to/pika-5k-16x"))
         );
-        if !std::path::Path::new(anvil_src).exists() {
+        if !std::path::Path::new(&anvil_src).exists() {
             // Skip silently if the dev's Pika 5K fixture is not on this box.
             eprintln!("SKIP: Pika 5K anvil.png not found at {}", anvil_src);
             return;

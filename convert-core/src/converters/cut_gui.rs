@@ -67,11 +67,11 @@ mod tests {
         // is not present.
         let rp_root = std::env::var("PIKA_5K_16X_PATH")
             .unwrap_or_else(|_| String::from("/path/to/pika-5k-16x"));
-        if !std::path::Path::new(rp_root).exists() {
+        if !std::path::Path::new(&rp_root).exists() {
             eprintln!("SKIP: Pika 5K not found at {}", rp_root);
             return;
         }
-        let src_container = std::path::Path::new(rp_root)
+        let src_container = std::path::Path::new(&rp_root)
             .join("assets/minecraft/textures/gui/container");
         if !src_container.exists() {
             eprintln!("SKIP: Pika 5K container folder missing");

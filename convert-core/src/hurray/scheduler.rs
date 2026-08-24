@@ -412,14 +412,18 @@ impl ProgressTracker {
 
     fn bump(&self, task_name: &str) {
         let current = self.done.fetch_add(1, Ordering::SeqCst) + 1;
-        let percent = (current * 100) / self.total;
-        log_info!(
-            "{}Progress: {}/{} ({}%) - {}",
-            self.prefix,
-            current,
-            self.total,
-            percent,
-            task_name
-        );
+        // 与桌面版一致的节流：每 50 个模块 + 最后一个模块才写日志，
+        // 避免大批量转换时日志洪泛拖慢引擎。
+        if current % 50 == 0 || current == self.total {
+            let percent = (current * 100) / self.total;
+            log_info!(
+                "{}Progress: {}/{} ({}%) - {}",
+                self.prefix,
+                current,
+                self.total,
+                percent,
+                task_name
+            );
+        }
     }
 }

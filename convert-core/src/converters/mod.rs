@@ -6,8 +6,10 @@ pub use rename_mcpatcher_to_optifine::rename_mcpatcher_to_optifine;
 
 pub mod adjust_hue_brightness;
 pub mod anims_folder_conversion;
+pub mod bedrock;
 pub mod blockstate_adapter;
 pub mod convert_old_texture_paths;
+pub mod convert_animated_textures;
 pub mod convert_sound_files;
 pub mod color_utils;
 pub mod cut_gui;
