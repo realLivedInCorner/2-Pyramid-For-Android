@@ -113,7 +113,7 @@ pub fn convert_zip(req: ConvertRequest) -> Result<ConvertReport, ConvertError> {
     if !input_zip.exists() {
         return Err(ConvertError::InputNotFound { path: req.input_zip.clone() });
     }
-    // Bedrock Latest（1000）已随桌面版同步实现：先按 Java 1.21.11（75）
+    // Bedrock Latest（1000）已随桌面版同步实现：先按 Java 26.2（88）
     // 走完整流水线，再执行 Bedrock 结构重组 + manifest.json（.mcpack）。
     // BedrockNotSupported 变体保留仅为兼容旧 binding，不再主动抛出。
     let output_path = process_zip(

@@ -1,0 +1,154 @@
+# ===============================================================
+# 2-Pyramid For Android — PR / main 验证 workflow
+# ===============================================================
+# 触发:
+#   - pull_request  → 任何对 main 的 PR
+#   - push to main  → merge 后
+#
+# 行为:
+#   1. 装 Rust toolchain + Android SDK + NDK 27
+#   2. 跑 cargo 编译 + UniFFI binding 生成
+#   3. 跑 ./gradlew :app:assembleDebug
+#   4. 上传 APK 作为 artifact(只保留 7 天)
+#
+# 不上传 release(那是 release.yml 的活)。
+# 不签名 release build(避免和 release workflow 串号,以及 PR 不应该有 release 权限)。
+# ===============================================================
+
+name: build
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# 同一个 PR 多 push 只跑最新的那个
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# 默认 token 只能 read;我们要写 cache 写 artifact,内置 GITHUB_TOKEN 够用
+permissions:
+  contents: read
+
+jobs:
+  build-debug:
+    name: Build APK (Debug)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      # 关键:让 Gradle 跳过自己的 buildRustAndroid task,
+      # Rust 编译由本 workflow 自己跑(更可控、可 cache)。
+      SKIP_RUST_BUILD: "true"
+      # 用本地 mirror 加速 Rust crates 拉取
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+    steps:
+      # ── [1] Checkout ─────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── [2] 工具链:Rust + Android SDK + JDK ──────────────────
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      - name: Cache cargo registry & target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: convert-core
+          cache-on-failure: true
+
+      - name: Install cargo-ndk + uniffi-bindgen
+        run: |
+          if ! command -v cargo-ndk >/dev/null 2>&1; then
+            cargo install cargo-ndk --locked
+          fi
+          if ! command -v uniffi-bindgen >/dev/null 2>&1; then
+            cargo install uniffi --features=cli --locked
+          fi
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK (NDK 27 + platform 36)
+        uses: android-actions/setup-android@v3
+        with:
+          # 项目 gradle.properties 指定 android.ndkVersion=27.2.12479018
+          # platform-tools / platforms;android-36 / build-tools;36.0.0 由 build 自动取最新
+          ndk-version: 27.2.12479018
+          sdk-version: 37
+          packages: |
+            platform-tools
+            platforms;android-36
+            build-tools;36.0.0
+
+      # ── [3] 装 Gradle 缓存 helper ─────────────────────────────
+      - name: Setup Gradle (with build cache)
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-disabled: false
+          gradle-home-cache-cleanup: true
+
+      # ── [4] 抽 JNA libjnidispatch.so 到 jniLibs ──────────────
+      # 项目 libs.versions.toml 注:jna jar 不含 android natives,
+      # 需要从 jna-platform aar 抽 libjnidispatch.so 到 jniLibs/<abi>/。
+      # CI 必做(本地用户也手动从 jar 抽,gitignore 整个 jniLibs 目录)。
+      - name: Extract JNA libjnidispatch.so
+        env:
+          JNA_VERSION: "5.14.0"
+          JNA_ABI_DIR: "arm64-v8a"
+        run: |
+          set -euo pipefail
+          JNI_LIBS="2fa-android/app/src/main/jniLibs/$JNA_ABI_DIR"
+          mkdir -p "$JNI_LIBS"
+          # JNA 5.x 把 android natives 放在 jna-platform aar 的 jni/<abi>/
+          curl -fL --retry 3 \
+            -o /tmp/jna-platform.aar \
+            "https://repo1.maven.org/maven2/net/java/dev/jna/jna-platform/${JNA_VERSION}/jna-platform-${JNA_VERSION}.aar"
+          unzip -j -o /tmp/jna-platform.aar \
+            "jni/${JNA_ABI_DIR}/libjnidispatch.so" \
+            -d "$JNI_LIBS"
+          ls -la "$JNI_LIBS"
+          echo "libjnidispatch.so extracted OK"
+
+      # ── [5] 编译 Rust + UniFFI binding ───────────────────────
+      - name: Build convert-core (Rust → .so + Kotlin binding)
+        run: bash tools/build-rust-android.sh arm64-v8a
+
+      # ── [6] 校验:GitHub Actions 禁止直接 commit 上去污染 ──
+      # version.properties 会被 Gradle 自动 +1,我们故意不 commit 回去:
+      #   - PR 上跑会让 diff 看着像"无故改了 version.properties"
+      #   - release workflow 会显式处理(见 release.yml)
+      - name: Show version diff (informational, do not commit)
+        run: |
+          if git diff --quiet 2fa-android/version.properties; then
+            echo "version.properties unchanged"
+          else
+            echo "::warning::version.properties auto-bumped by gradle, not committing back to source"
+            git diff 2fa-android/version.properties || true
+          fi
+
+      # ── [7] Gradle assembleDebug ─────────────────────────────
+      - name: Build debug APK
+        working-directory: 2fa-android
+        env:
+          # 关掉 Gradle 的更新检查,加速
+          GRADLE_OPTS: "-Dorg.gradle.daemon=false"
+        run: ./gradlew :app:assembleDebug --no-daemon --stacktrace
+
+      # ── [8] 上传 APK 作为 artifact ───────────────────────────
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-${{ github.sha }}
+          path: 2fa-android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 7

@@ -91,6 +91,19 @@ pub fn invoke_conversion(
     target_version: u32,
     source_version: u32,
 ) -> Result<(), Box<dyn Error>> {
+    invoke_conversion_ex(target_path, work_dir, target_version, source_version, true)
+}
+
+/// 与 [`invoke_conversion`] 相同，可控制是否执行 GuiSurgeon。
+/// 通向 Bedrock 的 Java 中间态应传 `run_gui_surgeon=false`，
+/// 避免 1.21 sprite 手术干扰后续 `gui/** → textures/ui` 重组。
+pub fn invoke_conversion_ex(
+    target_path: &Path,
+    work_dir: &Path,
+    target_version: u32,
+    source_version: u32,
+    run_gui_surgeon: bool,
+) -> Result<(), Box<dyn Error>> {
     use crate::{log_info, log_debug, log_warn};
     log_info!("==============================");
     log_info!("2-Pyramid DTD engine start");
@@ -145,6 +158,9 @@ pub fn invoke_conversion(
         delete_shaders_folder::delete_shaders_folder(ctx)
             .map_err(|e| e.to_string())
     });
+
+    // j2j 着色器：1.20→26.x 等边界用适配，而非整目录删除
+    crate::converters::java_shaders::register_scheduler_task(&mut scheduler);
 
     scheduler.register_task("delete_font_folder", TaskType::Exclusive, TaskTier::Eraser, |ctx| {
         delete_font_folder::delete_font_folder(ctx)
@@ -535,6 +551,9 @@ pub fn invoke_conversion(
             .map_err(|e| e.to_string())
     });
 
+    // 基岩 ↔ Java 结构转换：逻辑在 converters/bedrock/*，此处仅注册到 Scheduler
+    crate::converters::bedrock::register_tasks(&mut scheduler);
+
     log_debug!("all mapping table tasks registered");
 
     // ── 通过 Engine 执行 ──
@@ -550,14 +569,13 @@ pub fn invoke_conversion(
         .and_then(|s| s.to_str())
         .unwrap_or("pack");
     context.set_data("pack_name", pack_name);
+    // 着色器适配需要知道目标 pack_format（1.20→26.x 等）
+    context.set_data("target_pack_format", &target_version.to_string());
 
     scheduler.execute_version_conversion(&context, &mut texture_pool, source_version, target_version)?;
 
-    // Only run GuiSurgeon for target versions >= 34 (Java 1.21+)
-    // which use sprite-based UI. Pre-1.21 versions rely on atlas-based
-    // UI (inventory.png, etc.) — running GuiSurgeon would delete those
-    // atlas files and cause Minecraft to fall back to vanilla defaults.
-    if target_version >= 34 {
+    // GuiSurgeon：Java 1.21+ sprite UI。Bedrock 中间态跳过（见 invoke_conversion_ex）。
+    if run_gui_surgeon && target_version >= 34 {
         let mut resolution = crate::hurray::resolution::ResolutionTransducer::new();
         let _ = resolution.detect_resolution(work_dir);
         crate::converters::gui_surgeon::GuiSurgeon::execute_transformation(

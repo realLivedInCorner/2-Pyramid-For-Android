@@ -38,11 +38,10 @@ import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.FolderZip
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -81,6 +80,11 @@ import com.twopyramid.twofa.ui.viewmodel.HomeViewModel
 /**
  * ConvertScreen：队列 + 添加 Zip + ItemDetail + 选 target version dialog。
  *
+ * v1.3 改造：
+ *   - 删右下 FAB，"添加 Zip" 入口挪到 TopBar 右侧 "+" 图标
+ *   - 空状态从"两行字 + FAB"重做为"hero card + 主操作按钮"
+ *   - 队列非空时只显示列表 + TopBar 角标，不挡内容
+ *
  * 拆自 HomeScreen v1（让 Home 变介绍页 + 入口）。
  */
 @OptIn(ExperimentalMaterial3Api::class)
@@ -109,40 +113,28 @@ fun ConvertScreen(onBack: () -> Unit) {
         }
     }
 
+    val onPickZip: () -> Unit = { pickZipLauncher.launch(arrayOf("application/zip", "*/*")) }
+
     val sheetState = androidx.compose.material3.rememberModalBottomSheetState(skipPartiallyExpanded = true)
 
-    Box(modifier = Modifier.fillMaxSize()) {
-        Column(modifier = Modifier.fillMaxSize()) {
-            ConvertTopBar(
-                itemCount = items.size,
-                hasPending = items.any { it.status is QueueItem.Status.Queued },
-                onBack = onBack,
-            )
-            Box(modifier = Modifier.weight(1f)) {
-                if (items.isEmpty()) {
-                    ConvertEmpty(onAdd = { pickZipLauncher.launch(arrayOf("application/zip", "*/*")) })
-                } else {
-                    ConvertList(
-                        items = items,
-                        tokens = tokens,
-                        onItemClick = { detailItem = it },
-                    )
-                }
+    Column(modifier = Modifier.fillMaxSize()) {
+        ConvertTopBar(
+            itemCount = items.size,
+            hasPending = items.any { it.status is QueueItem.Status.Queued },
+            onBack = onBack,
+            onAdd = onPickZip,
+        )
+        Box(modifier = Modifier.weight(1f)) {
+            if (items.isEmpty()) {
+                ConvertEmpty(onAdd = onPickZip)
+            } else {
+                ConvertList(
+                    items = items,
+                    tokens = tokens,
+                    onItemClick = { detailItem = it },
+                )
             }
         }
-
-        // FAB 不进 Column，留底右下
-        ConvertFab(
-            hasPending = items.any { it.status is QueueItem.Status.Queued },
-            onStart = {
-                val intent = Intent(ctx, ZipQueueService::class.java)
-                ctx.startService(intent)
-            },
-            onAdd = { pickZipLauncher.launch(arrayOf("application/zip", "*/*")) },
-            modifier = Modifier
-                .align(Alignment.BottomEnd)
-                .padding(end = 12.dp, bottom = 12.dp),
-        )
     }
 
     if (pendingUri != null) {
@@ -187,7 +179,12 @@ fun ConvertScreen(onBack: () -> Unit) {
 }
 
 @Composable
-private fun ConvertTopBar(itemCount: Int, hasPending: Boolean, onBack: () -> Unit) {
+private fun ConvertTopBar(
+    itemCount: Int,
+    hasPending: Boolean,
+    onBack: () -> Unit,
+    onAdd: () -> Unit,
+) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -218,43 +215,13 @@ private fun ConvertTopBar(itemCount: Int, hasPending: Boolean, onBack: () -> Uni
                         color = BlueAccent,
                     )
                 }
+                Spacer(Modifier.width(4.dp))
+            }
+            // 顶部右侧 + 按钮（替代 v1.2.x 的右下 FAB，Material 3 标准模式）
+            IconButton(onClick = onAdd) {
+                Icon(Icons.Filled.Add, contentDescription = "添加 Zip", tint = OnSurfaceHigh)
             }
         }
-    }
-}
-
-@Composable
-private fun ConvertFab(
-    hasPending: Boolean,
-    onStart: () -> Unit,
-    onAdd: () -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    Row(
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        modifier = modifier,
-    ) {
-        AnimatedVisibility(
-            visible = hasPending,
-            enter = fadeIn() + slideInVertically(initialOffsetY = { it / 2 }),
-            exit = fadeOut() + slideOutVertically(targetOffsetY = { it / 2 }),
-        ) {
-            ExtendedFloatingActionButton(
-                onClick = onStart,
-                icon = { Icon(Icons.Default.PlayArrow, null) },
-                text = { Text("开始转换") },
-                containerColor = BlueAccent,
-                contentColor = Color.White,
-            )
-        }
-        ExtendedFloatingActionButton(
-            onClick = onAdd,
-            icon = { Icon(Icons.Default.Add, null) },
-            text = { Text("添加 Zip") },
-            containerColor = OnSurfaceHigh,
-            contentColor = Color.White,
-        )
     }
 }
 
@@ -265,27 +232,69 @@ private fun ConvertEmpty(modifier: Modifier = Modifier, onAdd: () -> Unit) {
         enter = fadeIn() + scaleIn(initialScale = 0.96f),
         modifier = modifier.fillMaxSize(),
     ) {
+        // v1.3: hero card 空状态 — 大图标 + 主操作按钮 + 副 hint
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(32.dp),
+                .padding(horizontal = 24.dp),
             verticalArrangement = Arrangement.Center,
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            Spacer(Modifier.weight(0.5f))
+            GlassCard(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(24.dp),
+                elevation = 2.dp,
+                shadowRadius = 12.dp,
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 24.dp, vertical = 32.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    // 圆形 backdrop + 大图标
+                    Box(
+                        modifier = Modifier
+                            .size(72.dp)
+                            .clip(CircleShape)
+                            .background(BlueAccent.copy(alpha = 0.12f)),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            Icons.Filled.FolderZip,
+                            contentDescription = null,
+                            tint = BlueAccent,
+                            modifier = Modifier.size(36.dp),
+                        )
+                    }
+                    Spacer(Modifier.height(20.dp))
+                    Text(
+                        "还没有待转换的 zip",
+                        style = MaterialTheme.typography.titleLarge,
+                        color = OnSurfaceHigh,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        "从文件管理器里选一个 Minecraft 资源包",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = OnSurfaceLow,
+                    )
+                    Spacer(Modifier.height(24.dp))
+                    // 主操作按钮 — 满宽,跟 v1.2 的 PrimaryActionButton 风格一致
+                    PrimaryActionButton(
+                        text = "选择 Zip 文件",
+                        onClick = onAdd,
+                    )
+                }
+            }
+            Spacer(Modifier.height(20.dp))
+            // 副 hint:从历史/批量入口预留(后续版本加)
             Text(
-                "还没有待转换的 zip",
-                style = MaterialTheme.typography.headlineSmall,
-                color = OnSurfaceHigh,
-                fontWeight = FontWeight.Medium,
-            )
-            Spacer(Modifier.height(8.dp))
-            Text(
-                "点右下角「添加 Zip」开始",
-                style = MaterialTheme.typography.bodyMedium,
+                "提示:选完文件后会让你挑目标版本",
+                style = MaterialTheme.typography.bodySmall,
                 color = OnSurfaceLow,
             )
-            Spacer(Modifier.weight(1f))
         }
     }
 }
@@ -650,6 +659,8 @@ private fun StatusBadge(status: com.twopyramid.twofa.settings.AppSettings.Versio
             BlueAccent to Color.White  // 蓝
         com.twopyramid.twofa.settings.AppSettings.VersionStatus.RECOMMENDED ->
             Color(0xFFB45309) to Color(0xFFFEF3C7)  // 琥珀
+        com.twopyramid.twofa.settings.AppSettings.VersionStatus.BETA ->
+            Color(0xFF4C1D95) to Color(0xFFE9D5FF)  // 紫
     }
     Box(
         modifier = Modifier

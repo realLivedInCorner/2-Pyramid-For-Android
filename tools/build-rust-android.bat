@@ -45,7 +45,7 @@ REM [2] rustup target add (best effort: rsproxy mirror works, tuna 404s)
 echo [2/5] rustup target add %TARGET_TRIPLE%
 rustup target add %TARGET_TRIPLE%
 if errorlevel 1 (
-    echo       [WARN] rustup target add failed (mirror 404), falling back to local wrapper
+    echo       [WARN] rustup target add failed - using local wrapper
     set "USE_WRAPPER=1"
 ) else (
     set "USE_WRAPPER=0"

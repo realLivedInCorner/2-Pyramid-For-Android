@@ -37,12 +37,12 @@ logger.lifecycle("[2FA] versionCode -> $newVersionCode")
 
 android {
     namespace = "com.twopyramid.twofa"
-    compileSdk = 36
+    compileSdk = 37
 
     defaultConfig {
         applicationId = "com.twopyramid.twofa"
         minSdk = 31
-        targetSdk = 36
+        targetSdk = 37
         versionCode = newVersionCode
         versionName = "2.0.0-alpha.$newVersionCode"
 

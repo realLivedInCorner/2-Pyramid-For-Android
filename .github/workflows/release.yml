@@ -1,0 +1,179 @@
+# ===============================================================
+# 2-Pyramid For Android — Release workflow
+# ===============================================================
+# 触发:
+#   - push tag v*  → 例如 v1.0.0 / v0.1.0 / v2.0.0-alpha.5
+#   - workflow_dispatch → 手动触发(可选要不要打 tag,默认 false)
+#
+# 行为:
+#   1. 装全套工具链(Rust / Android SDK / NDK 27)
+#   2. 编译 Rust convert-core → .so + UniFFI binding
+#   3. 跑 ./gradlew :app:assembleRelease(用 debug.keystore 签名,跟本地一致)
+#   4. 把 APK 上传为 GitHub Release asset,自动写 changelog
+#   5. 把 version.properties 自动 +1 写回 main 分支
+#
+# 设计要点:
+#   - 跟 build.yml 同样的 Ubuntu + cache 链路
+#   - apk 直接挂 Release(用户自己后续可以替换成正式签名)
+#   - 复用 build.yml 的所有 hack:SKIP_RUST_BUILD + JNA 抽包 + debug keystore
+# ===============================================================
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  # workflow_dispatch 故意不开:release 必须有 tag,手动跑用 build.yml 的 dispatch 即可
+  # (dispatch 触发时 github.ref 是 main 分支,不是 tag,softprops action-gh-release 会失败)
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false  # release 不能被打断
+
+permissions:
+  contents: write  # 需要 push 回去 version.properties + 创建 release
+
+jobs:
+  build-release:
+    name: Build & Upload Release APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      SKIP_RUST_BUILD: "true"
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+    steps:
+      # ── [1] Checkout(带 fetch-tags,workflow_dispatch 也要全 history)──
+      - name: Checkout repository (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      # ── [2] 工具链 ─────────────────────────────────────────
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      - name: Cache cargo registry & target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: convert-core
+          cache-on-failure: true
+
+      - name: Install cargo-ndk + uniffi-bindgen
+        run: |
+          if ! command -v cargo-ndk >/dev/null 2>&1; then
+            cargo install cargo-ndk --locked
+          fi
+          if ! command -v uniffi-bindgen >/dev/null 2>&1; then
+            cargo install uniffi --features=cli --locked
+          fi
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK (NDK 27 + platform 36)
+        uses: android-actions/setup-android@v3
+        with:
+          ndk-version: 27.2.12479018
+          sdk-version: 37
+          packages: |
+            platform-tools
+            platforms;android-36
+            build-tools;36.0.0
+
+      - name: Setup Gradle (with build cache)
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-disabled: false
+          gradle-home-cache-cleanup: true
+
+      # ── [3] 抽 JNA libjnidispatch.so ───────────────────────
+      - name: Extract JNA libjnidispatch.so
+        env:
+          JNA_VERSION: "5.14.0"
+          JNA_ABI_DIR: "arm64-v8a"
+        run: |
+          set -euo pipefail
+          JNI_LIBS="2fa-android/app/src/main/jniLibs/$JNA_ABI_DIR"
+          mkdir -p "$JNI_LIBS"
+          curl -fL --retry 3 \
+            -o /tmp/jna-platform.aar \
+            "https://repo1.maven.org/maven2/net/java/dev/jna/jna-platform/${JNA_VERSION}/jna-platform-${JNA_VERSION}.aar"
+          unzip -j -o /tmp/jna-platform.aar \
+            "jni/${JNA_ABI_DIR}/libjnidispatch.so" \
+            -d "$JNI_LIBS"
+          ls -la "$JNI_LIBS"
+
+      # ── [4] 编译 Rust ─────────────────────────────────────
+      - name: Build convert-core (Rust → .so + Kotlin binding)
+        run: bash tools/build-rust-android.sh arm64-v8a
+
+      # ── [5] 生成 CI debug keystore + 跑 release build ─────
+      # release buildType 用 ~/.android/debug.keystore 签名(项目里写死的)
+      - name: Generate debug keystore for CI signing
+        run: bash tools/setup-ci-keystore.sh
+
+      - name: Build release APK (signed with debug keystore)
+        working-directory: 2fa-android
+        env:
+          GRADLE_OPTS: "-Dorg.gradle.daemon=false"
+        run: ./gradlew :app:assembleRelease --no-daemon --stacktrace
+
+      # ── [6] 重命名 + 收集 artifacts ────────────────────────
+      - name: Rename APK with version
+        id: rename
+        working-directory: 2fa-android/app/build/outputs/apk/release
+        run: |
+          set -euo pipefail
+          # app-release.apk → 2-Pyramid-For-Android-<versionCode>.apk
+          original="$(ls *.apk | head -1)"
+          version_code="$(grep VERSION_CODE ../../../../version.properties | cut -d= -f2 | tr -d ' ')"
+          new_name="2-Pyramid-For-Android-${version_code}.apk"
+          mv "$original" "$new_name"
+          echo "new_name=$new_name" >> "$GITHUB_OUTPUT"
+          echo "version_code=$version_code" >> "$GITHUB_OUTPUT"
+          echo "renamed: $original → $new_name"
+          ls -la
+
+      # ── [7] 创建 GitHub Release + 挂 APK ──────────────────
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          # release workflow 只能在 push tag 时触发(见 on:),所以 tag_name 就是 ref_name
+          tag_name: ${{ github.ref_name }}
+          name: 2-Pyramid For Android ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            2fa-android/app/build/outputs/apk/release/2-Pyramid-For-Android-${{ steps.rename.outputs.version_code }}.apk
+          # release body 由 generate_release_notes 自动生成
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── [8] 把 version.properties 写回 main(可选) ─────────
+      # Gradle 自动 +1 后的 version.properties 提交回 main,让下一次 build 接着往上加。
+      # 只有在 tag 触发的 release 才做(避免手动触发污染 main)。
+      - name: Commit version.properties back to main
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          if git diff --quiet 2fa-android/version.properties; then
+            echo "version.properties unchanged, nothing to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add 2fa-android/version.properties
+          # 提到 RELEASE 版本号方便审计
+          new_version="$(grep VERSION_CODE 2fa-android/version.properties | cut -d= -f2 | tr -d ' ')"
+          git commit -m "ci: bump VERSION_CODE to ${new_version} (release ${{ github.ref_name }})"
+          git push origin main
+          echo "version.properties committed: VERSION_CODE=${new_version}"

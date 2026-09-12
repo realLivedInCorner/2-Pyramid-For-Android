@@ -33,15 +33,17 @@ object AppSettings {
         TRAILS_TALES("Trails & Tales", "足迹与传说"),
         TRICKY_TRIALS("Tricky Trials", "试炼密室"),
         BRAVERY("Bundles of Bravery", "勇者之束"),
+        BEDROCK("Bedrock", "基岩版"),
     }
 
     enum class VersionStatus(val label: String) {
         STABLE("稳定"),
         LATEST("最新"),
         RECOMMENDED("推荐"),
+        BETA("测试"),
     }
 
-    /** 版本列表（v1.2.2：对齐 PC 端 22 个版本） */
+    /** 版本列表（对齐 PC 端 ConversionPage，含 26.2 与 Bedrock） */
     val versions: List<VersionEntry> = listOf(
         // Classic（3）
         VersionEntry(1,  "1.6-1.8",       "1.6 → 1.8",        VersionEra.CLASSIC),
@@ -71,8 +73,11 @@ object AppSettings {
         VersionEntry(64, "1.21.7-1.21.8", "1.21.7 → 1.21.8",  VersionEra.TRICKY_TRIALS),
         VersionEntry(69, "1.21.9-1.21.10","1.21.9 → 1.21.10", VersionEra.TRICKY_TRIALS),
         VersionEntry(75, "1.21.11",       "1.21.11",          VersionEra.TRICKY_TRIALS, VersionStatus.STABLE),
-        // Bravery（1）
+        // Bravery（2）
         VersionEntry(84, "26.1-26.1.2",   "26.1 → 26.1.2",    VersionEra.BRAVERY, VersionStatus.LATEST),
+        VersionEntry(88, "26.2",          "26.2",             VersionEra.BRAVERY, VersionStatus.LATEST),
+        // Bedrock（1）— 先转 Java 26.2 再 j2b
+        VersionEntry(1000, "Bedrock",     "Bedrock Latest",   VersionEra.BEDROCK, VersionStatus.BETA),
     )
 
     /** targetVersionChoices：扁平 pack_format 列表（保留兼容 v1.1 之前的 API） */
