@@ -22,7 +22,7 @@ val primaryAbi: String = "arm64-v8a"
 // version.properties 在 2fa-android/ 根目录，存 VERSION_CODE。
 // 第一次跑：读 0 → +1 → 写 1。
 // 第 N 次：读 N-1 → +1 → 写 N。
-// versionName 自动拼成 "2.0.0-alpha.<versionCode>"，跟随 versionCode 走。
+// versionName 固定为正式版 2.0.0（versionCode 仍自动 +1）
 val versionPropsFile = rootProject.file("version.properties")
 val versionProps = Properties().apply {
     if (versionPropsFile.exists()) {
@@ -44,7 +44,7 @@ android {
         minSdk = 31
         targetSdk = 37
         versionCode = newVersionCode
-        versionName = "2.0.0-alpha.$newVersionCode"
+        versionName = "2.0.0"
 
         ndk {
             abiFilters += abiList
