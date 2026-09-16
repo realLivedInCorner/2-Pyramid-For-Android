@@ -7,7 +7,7 @@
 <h1 align="center">2-Pyramid for Android</h1>
 
 <p align="center">
-  <strong>资源包版本转换器的 Android 原生版本 · The Nextgen Multi-Version Universal Resource Pack Converter, on Android</strong>
+  <strong>资源包版本转换器的 Android 原生版本 · Modern Universal Multi-Version Resource Pack Converter, on Android</strong>
 </p>
 
 <p align="center">
