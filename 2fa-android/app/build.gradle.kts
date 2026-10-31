@@ -18,11 +18,43 @@ val rustCrateDir: String =
 val abiList: List<String> = listOf("arm64-v8a")
 val primaryAbi: String = "arm64-v8a"
 
+// ── Android SDK / NDK 解析（配置期一次）────────────────────────────────
+// 背景（L1 构建基线修复）：本机 ANDROID_HOME / ANDROID_NDK_HOME / ANDROID_SDK_ROOT 全为空，
+// 而 `cargo ndk`（buildRustAndroid → tools/build-rust-android.bat）依赖这两个环境变量；
+// AGP 自己从 local.properties 的 sdk.dir 找 SDK，cargo-ndk 不会 —— 因此这里在配置期解析一次，
+// 并在 Exec 任务里**显式注入子进程环境**。原则：只读本机配置，不改用户 SDK 目录，也不写机器级环境变量。
+//   - SDK：ANDROID_HOME → ANDROID_SDK_ROOT → local.properties 的 sdk.dir
+//   - NDK：ANDROID_NDK_HOME → <SDK>/ndk/<android.ndkVersion>（gradle.properties，27.3）→ <SDK>/ndk 下任意版本
+val androidNdkVersion: String =
+    (project.findProperty("android.ndkVersion") as String?) ?: "27.3.13750724"
+
+val androidSdkDir: File? = run {
+    val localProps = Properties()
+    val localPropsFile = rootProject.file("local.properties")
+    if (localPropsFile.exists()) {
+        localPropsFile.inputStream().use { localProps.load(it) }
+    }
+    val configured = System.getenv("ANDROID_HOME")
+        ?: System.getenv("ANDROID_SDK_ROOT")
+        ?: localProps.getProperty("sdk.dir")
+    configured?.takeIf { it.isNotBlank() }?.let { File(it) }?.takeIf { it.isDirectory }
+}
+
+val androidNdkDir: File? = run {
+    val fromEnv = System.getenv("ANDROID_NDK_HOME")
+        ?.takeIf { it.isNotBlank() }?.let { File(it) }?.takeIf { it.isDirectory }
+    if (fromEnv != null) return@run fromEnv
+    val ndkParent = androidSdkDir?.resolve("ndk")
+    val exact = ndkParent?.resolve(androidNdkVersion)?.takeIf { it.isDirectory }
+    if (exact != null) return@run exact
+    ndkParent?.listFiles()?.filter { it.isDirectory }?.maxByOrNull { it.name }
+}
+
 // ── 自动 versionCode +1（每次 build 跑过就 +1，不用手动改）─────────────
 // version.properties 在 2fa-android/ 根目录，存 VERSION_CODE。
 // 第一次跑：读 0 → +1 → 写 1。
 // 第 N 次：读 N-1 → +1 → 写 N。
-// versionName 固定为正式版 2.0.0（versionCode 仍自动 +1）
+// versionName 固定为正式版 2.1.0（versionCode 仍自动 +1）
 val versionPropsFile = rootProject.file("version.properties")
 val versionProps = Properties().apply {
     if (versionPropsFile.exists()) {
@@ -44,7 +76,7 @@ android {
         minSdk = 31
         targetSdk = 37
         versionCode = newVersionCode
-        versionName = "2.0.0"
+        versionName = "2.1.0"
 
         ndk {
             abiFilters += abiList
@@ -162,15 +194,38 @@ if (runRustBuild) {
         description = "Compile Rust convert-core to .so + Kotlin UniFFI bindings (slow first time)"
         dependsOn("installRustTargets")
 
+        // 脚本在**仓库根** tools/ 下，而 Gradle rootDir 是 2fa-android/ ——
+        // 原代码 `"$rootDir\\tools\\build-rust-android.bat"` 解析到不存在的 2fa-android/tools/，
+        // 导致默认 assembleDebug 在 preBuild 直接失败（L1 硬阻塞 #1）。
+        val rustBuildScript = rootProject.file("../tools/build-rust-android.bat")
+        commandLine("cmd.exe", "/c", rustBuildScript.absolutePath, primaryAbi)
+
+        // 显式给子进程注入 SDK/NDK 环境（cargo-ndk 依赖；AGP 用的是 local.properties，两者不共享）
+        androidSdkDir?.let {
+            environment("ANDROID_HOME", it.absolutePath)
+            environment("ANDROID_SDK_ROOT", it.absolutePath)
+        }
+        androidNdkDir?.let { environment("ANDROID_NDK_HOME", it.absolutePath) }
+        environment("ANDROID_NDK_VERSION", androidNdkVersion)
+
         doFirst {
+            if (!rustBuildScript.isFile) {
+                error("[2FA] Rust 构建脚本不存在：${rustBuildScript.absolutePath}")
+            }
+            if (androidSdkDir == null) {
+                logger.warn("[2FA] 未能解析 Android SDK（ANDROID_HOME/ANDROID_SDK_ROOT/local.properties 均不可用）")
+            }
+            if (androidNdkDir == null) {
+                logger.warn("[2FA] 未能解析 NDK $androidNdkVersion（ANDROID_NDK_HOME 未设且 <SDK>/ndk 下没有）")
+            }
+            logger.lifecycle(
+                "[2FA] Rust toolchain env: ANDROID_HOME=${androidSdkDir?.absolutePath ?: "<unresolved>"} " +
+                    "ANDROID_NDK_HOME=${androidNdkDir?.absolutePath ?: "<unresolved>"}"
+            )
             val soDir = file("src/main/jniLibs/$primaryAbi")
             soDir.mkdirs()
             logger.lifecycle("[2FA] Building Rust for $primaryAbi → $soDir")
         }
-
-        commandLine(
-            "cmd.exe", "/c", "$rootDir\\tools\\build-rust-android.bat", primaryAbi
-        )
     }
 
     // 让 AS Run (Assemble + preBuild) 自动触发 Rust 编译
