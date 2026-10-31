@@ -718,3 +718,12 @@ A-ROM 的 `BlobStore` 是 `Vec<Arc<Vec<u8>>>`，`MixedRunOptions.blob_limit = No
 `_sync/` 下有：`fixtures/`（format 1/15 合成包）、`reference/no-uimage/` + `with-uimage/`（桌面 CLI 两套 oracle）、
 `reference/host-engine/`（Android 引擎 host 差分结果 manifest）、`compare.py`、`ndk-probe/`、
 `reports/l6-verification.md`。这些是**本地验证资产**，按设计不进 Android 仓库；后续需要时可重跑。
+
+### C4. UImage 边界在实施后调整（已补齐）
+
+L0 报告把「UImage 原版资源不打包」列为 out-of-scope；实施完成后按用户要求补齐：
+桌面 `src-tauri/UImage/` 的 80 张 PNG（570,387 B）打包进 `app/src/main/assets/UImage/`，
+`Application.onCreate` 首次启动解压到 `filesDir/UImage` 后再 `initRuntime`。
+host 差分对 `reference/with-uimage` 的 15 个 case 复测 **15/15 PASS**，证明依赖 UImage 的生成任务与桌面一致；
+代价是 release APK +0.6 MB（10.1 → 10.2 MB）。真机首次解压与像素结果仍待验证。
+同一个「Kotlin 嵌套注释」坑在新增 Kotlin 注释里复现（`assets/UImage/**`），规则已扩展见 C1。

@@ -264,3 +264,21 @@ generated_at / generator_version / generator_build）。
   release APK **10,106,073 B（10.1 MB）**，`minSdk 31` / `targetSdk 37` / arm64-v8a；
 - host 差分：`_sync/reference/run_host_engine.ps1` 对 15 个 no-UImage oracle case **15/15 PASS，unexplained=0**；
 - 详细证据：`_sync/reports/l6-verification.md`；仓库内同步记录：`docs/desktop-sync-2.203.md`。
+
+---
+
+## 10. UImage 素材补齐（2026-10-31，同步后追加）
+
+初始同步按「UImage 不打包」边界执行；后按用户要求补齐：
+
+- **素材**：桌面 `src-tauri/UImage/`（80 张 PNG / 16 个分类 / 570,387 B）原样复制到
+  `2fa-android/app/src/main/assets/UImage/`（随 APK 打包，+0.6 MB）。
+- **首次启动解压**：新增 `util/UImageAssets.kt`，在 `TwoFAApp.onCreate` → `RustNative.initialize` 之前把
+  assets 同步解压到 `filesDir/UImage`；用 `.asset_version` 标记避免每次启动重解压（素材更新时 +1 版本号）。
+  Rust 侧 `get_uimage_path()` 因此返回可用目录，7 组依赖原版素材的生成任务恢复。
+- **验证**：host 差分 runner 显式传 `--uimage <桌面 UImage/>`，对 `_sync/reference/with-uimage` 的 15 个 case
+  重跑对比：**15/15 PASS，unexplained=0**（加入前用 no-uimage oracle 也是 15/15；两套 oracle 分别对应
+  「无素材」与「有素材」两种设备状态）。APK 内 `assets/UImage/` 80 项、570,387 B 已检查。
+- **未验证**：真机首次启动解压耗时/失败回退；依赖素材的生成任务在 ARM 设备上的像素结果（host 已验证算法一致）。
+- **顺带踩坑**：`UImageAssets.kt` 注释里写 `` `assets/UImage/**` `` 又触发 Kotlin 嵌套注释（`Unclosed comment`）；
+  规则已扩展到所有 Kotlin/Rust 注释：**不要出现 `/*` 序列**。

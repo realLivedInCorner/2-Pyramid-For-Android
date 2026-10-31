@@ -34,12 +34,14 @@ Android 原生移植版。**v2.1.0** 起与桌面 **2.203.0 的 M3 / A-ROM 转�
 - **M3 / A-ROM 内核** — 单一对象模型（`Pack`/`Tx`/`Layer`）与 46 个原生任务；Java 目标产物直接写 zip
 - **转换选项** — 着色器适配、彻底删 shaders、1.21.4+ 物品定义升级、OptiFine CIT 转换/删除、
   `2pyr-gen.json` 参数记录、输出命名模板（默认值严格对齐桌面）
+- **UImage 素材已内置** — 桌面版同款 80 张原版素材（0.56 MB）随 APK 打包，首次启动解压到
+  `filesDir/UImage`；依赖原版素材的生成类任务（tipped arrow / smithing overlay / snow bucket / overlay icons 等）可用
 - **真实进度与结果** — 引擎级进度回调（解压 / 任务 / 打包）+ 结果页展示源→目标、耗时、
   跳过数 `skipped` 与说明 `notes`
 - **原生 Android** — Kotlin 2.0 + Jetpack Compose Material 3，Foreground Service (`dataSync`) 后台队列，
   浅色/深色/跟随系统三档主题
 - **本地处理** — 资源包全程在设备本地处理，不上传任何数据
-- **轻量 APK** — R8 + 资源裁剪后约 **10 MB**（`arm64-v8a` only；`.so` ≈ 5.5 MB）
+- **轻量 APK** — R8 + 资源裁剪后约 **10.2 MB**（`arm64-v8a` only；`.so` ≈ 5.5 MB）
 - **JNA 桥接** — UniFFI 0.32 生成的 Kotlin binding 通过 JNA 调 `.so` 中的 Rust 函数
 
 ### 🚀 快速开始
@@ -186,10 +188,8 @@ SKIP_RUST_BUILD=true ./gradlew :app:compileDebugKotlin
 
 ### ⚠️ 已知限制
 
-- **UImage 原版资源未打包**：依赖 UImage 的生成类任务（部分 tipped arrow / smithing overlay / snow bucket /
-  overlay icons 等）会跳过，相关外观可能缺省；与旧版行为一致。
-- **未在真机验证**：本仓库的构建与差分验证在 PC 上完成；TMPDIR、JNA 跨线程进度回调、SAF 输入/输出、
-  256x/512x 大包内存与耗时需要实机确认。
+- **未在真机验证**：本仓库的构建与差分验证在 PC 上完成；UImage 首次启动解压、TMPDIR、JNA 跨线程进度回调、
+  SAF 输入/输出、256x/512x 大包内存与耗时需要实机确认。
 - **Bedrock 双向转换是实验性**：j2b/b2j 未完成，仅用于测试。
 - **OptiFine CIT 转换默认关闭**：有用户报告 1.20.1 → 1.21.9–1.21.10 弓/钻石剑紫黑；离线 codec 已修正但
   未实机复现，按产品决策默认不生成（转换页可显式打开，请自行在游戏内验证）。
@@ -225,7 +225,7 @@ with the Tauri shell stripped and the engine bridged into Kotlin / Jetpack Compo
 - **Native Android** — Kotlin 2.0 + Jetpack Compose Material 3, Foreground Service (`dataSync`) queue,
   light/dark/system themes
 - **Fully local** — files never leave the device
-- **Tiny APK** — ~10 MB after R8 + resource shrink (`arm64-v8a` only; `.so` ≈ 5.5 MB)
+- **Tiny APK** — ~10.2 MB after R8 + resource shrink (`arm64-v8a` only; `.so` ≈ 5.5 MB)
 - **UniFFI bridge** — UniFFI 0.32 generated Kotlin binding via JNA into the Rust `.so`
 
 ### 🚀 Quick Start
@@ -325,11 +325,9 @@ SKIP_RUST_BUILD=true ./gradlew :app:compileDebugKotlin
 
 ### ⚠️ Known Limitations
 
-- **UImage assets are not bundled**: tasks that need vanilla assets (some tipped-arrow / smithing-overlay /
-  snow-bucket / overlay-icon generation) are skipped, so some derivative textures may be missing
-  (same behaviour as the previous Android version).
-- **Not verified on a physical device**: build and differential verification were done on a PC; TMPDIR,
-  cross-thread JNA progress callbacks, SAF I/O and large-pack memory usage still need device testing.
+- **Not verified on a physical device**: build and differential verification were done on a PC; the
+  first-launch UImage extraction, TMPDIR, cross-thread JNA progress callbacks, SAF I/O and large-pack
+  memory usage still need device testing.
 - **Bedrock conversion is experimental** — j2b/b2j are incomplete and for testing only.
 - **OptiFine CIT conversion is off by default** — users reported purple/black bow and diamond sword after
   1.20.1 → 1.21.9–1.21.10; the codec issue was fixed offline but not reproduced on-device, so it is gated off

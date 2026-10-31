@@ -8,12 +8,14 @@ import android.util.Log
 import com.twopyramid.twofa.history.HistoryRepository
 import com.twopyramid.twofa.native.RustNative
 import com.twopyramid.twofa.settings.SettingsRepository
+import com.twopyramid.twofa.util.UImageAssets
 import java.io.File
 
 /**
  * Application 类：启动时初始化
  *  - Native 库（Rust → JNI → UniFFI）—— 失败也不能让 App 崩
  *  - 全局运行时路径（log / app data / UImage）
+ *  - UImage 原版素材（assets/UImage → filesDir/UImage，首次启动解压）
  *  - Foreground Service 通知 Channel
  */
 class TwoFAApp : Application() {
@@ -39,7 +41,10 @@ class TwoFAApp : Application() {
 
     private fun initializeRust() {
         val appFilesDir: File = filesDir
-        val uimageDir: File = File(appFilesDir, "UImage").apply { mkdirs() }
+        // UImage 原版素材：随 APK 打包在 assets/UImage，首次启动解压到 filesDir/UImage。
+        // 必须在 RustNative.initialize 之前完成（引擎的 get_uimage_path 依赖这个目录）。
+        val uimageDir: File = File(appFilesDir, "UImage")
+        UImageAssets.ensureExtracted(this, uimageDir)
         val logDir: File = File(appFilesDir, "logs").apply { mkdirs() }
         // Android 没有可写的 /tmp：引擎 tempfile / std::env::temp_dir() 必须落在 cacheDir。
         // Rust 侧 init_runtime 会同时 set_var("TMPDIR", tempDir)。
