@@ -1,0 +1,3540 @@
+//! M2：混合运行驱动。
+//!
+//! 目标：让 **A-ROM 接管一次真实转换的读入与写出**，而任务仍按既定节奏迁移。
+//! 第一版（本文件）刻意不要求迁移任何任务——全部旧任务经 [`pathview`](crate::arom::pathview)
+//! 适配层跑，用来回答一个必须先回答的问题：
+//!
+//! > 把「解压到临时目录 → 跑任务 → 重新打包」换成
+//! > 「建 Pack → 落盘给任务 → 收成层 → A-ROM 序列化」，
+//! > **产物是不是一模一样？**
+//!
+//! 流程：
+//!
+//! ```text
+//! Pack::open(输入)
+//!   → materialize(有效条目落盘 + 基线哈希)
+//!   → legacy_run(workdir)        // 旧执行器，签名不变：给它一个目录
+//!   → harvest(对比基线产出一层) → commit
+//!   → write_zip(A-ROM 序列化)
+//! ```
+//!
+//! 与旧管线的唯一差别就是「字节从哪里来、写到哪里去」，因此两者的产物必须逐项一致——
+//! 这正是本模块的验收方式（见文件末尾用例）。
+//!
+//! 迁移已完成：46 个任务**全部**是原生 `Tx` 实现（[`crate::natives`]），没有适配层、
+//! 没有回退路径。任务顺序来自 [`crate::arom::engine::scheduler::Scheduler::plan`]，
+//! 阶段来自 [`crate::task_registry`]。
+
+use std::path::{Path, PathBuf};
+
+use crate::arom::pathview::{harvest, materialize};
+use crate::arom::serialize::{write_zip, SerializeOptions, SerializeStats};
+use crate::arom::task::{TaskDecl, Tier};
+use crate::arom::{AromError, Body, Layer, Materialized, Pack, SafeLimits, Slot};
+
+/// 逐模块迁移开关（**编译期**：默认全关，行为与旧管线逐字一致）。
+///
+/// 打开某模块后，该模块**已迁移**的任务由 A-ROM 原生执行，其余仍在 `workdir` 上跑旧闭包。
+/// 每个开关都能单独关回去——这是「每批可独立回退」的落点。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NativeSwitches {
+    /// textures 模块：已迁移的三个活任务（`delete_font_folder` /
+    /// `rename_mcpatcher_to_optifine` / `convert_animated_textures`）。
+    pub textures: bool,
+    /// ui 模块：已迁移的 `process_chest_folder`。
+    pub ui: bool,
+    /// reverse 模块：已迁移的 `reverse_process_chest_folder`。
+    pub reverse: bool,
+}
+
+impl NativeSwitches {
+    /// 全关（等价于旧管线）。
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// 全部已迁移任务。
+    pub fn all() -> Self {
+        Self {
+            textures: true,
+            ui: true,
+            reverse: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MixedRunOptions {
+    /// 读入限额。已裁决取宽松值（不改变今天能转的包）。
+    pub limits: SafeLimits,
+    pub serialize: SerializeOptions,
+    /// 层内字节预算（`None` = 不限；溢出后端在后续里程碑接入）。
+    pub blob_limit: Option<u64>,
+    pub source_version: u32,
+    pub target_version: u32,
+    /// 与 `invoke_conversion_ex` 的三个开关一致；驱动据此建**同一份**注册表。
+    pub run_gui_surgeon: bool,
+    pub fix_alpha_layers: bool,
+    pub adapt_shaders: bool,
+    /// **彻底删除 shaders**（用户开关，默认 **false**）。
+    ///
+    /// 存在的理由：`adapt_java_shaders` 只做**文本改写**（fog / `#moj_import` /
+    /// globals 注入 / core 组改名），它无法让一份**结构上**已经不兼容的着色器包
+    /// 变得能加载。用户的实测反馈是：部分包里即便开了适配，游戏仍在加载阶段失败，
+    /// 而唯一可控的做法是把 shaders 整棵拿掉——代价是包里的自定义光影不再生效，
+    /// 游戏改用原版渲染。所以这是一个**用户显式选择**，不是默认优化。
+    ///
+    /// 语义：见 [`run_native`] 里"shaders 全删"那一段（删两个根：
+    /// `assets/minecraft/shaders` 与顶层 `shaders/`，走延迟删除的清理点）。
+    ///
+    /// **关闭时必须与改动前逐字节相同**：本项不参与任何任务、不改计划、不改
+    /// 序列化选项，只在为真时多提交一个 tombstone 层。
+    pub delete_shaders: bool,
+    /// **是否把旧 `overrides` 升成 1.21.4+ 物品定义**（`generate_item_definitions`，
+    /// 默认 **true**）。
+    ///
+    /// 关闭 = 计划里**不派发**该任务：不写 `assets/minecraft/items/*.json`，包里的
+    /// `models/item/*.json` 一个字节都不动。代价是 1.21.4+ 不再读 `overrides`
+    /// （弓的拉弦、时钟帧动画、全部 `CustomModelData` 外观退回原版）——这是用户
+    /// 显式选择，不是优化。
+    ///
+    /// **只影响这条任务**：CIT 转换（[`Self::convert_cit`]）是另一条输入路径，
+    /// 它可以在没有默认定义时自己造一份（见 `merge_into_definition` 的 None 分支）。
+    pub convert_item_definitions: bool,
+    /// **是否把 OptiFine CIT 转成 1.21.4+ 物品定义**（`generate_cit_item_definitions`，
+    /// 默认 **false**）。
+    ///
+    /// 关闭 = 不生成定义，但 `optifine/cit/**` 与 `mcpatcher/cit/**` **原样保留**。
+    /// 这不是"删除"，装 OptiFine 的客户端仍会用那些文件；用户关它的典型理由是
+    /// "新版定义在自己这边不生效，不如留给 OptiFine"。
+    ///
+    /// ## 为什么默认关（2026-10 止血，待实机验证）
+    ///
+    /// 用户报告 1.20.1 布吉岛包转 1.21.9–1.21.10 后弓与钻石剑黑紫。2.203.0 已修掉
+    /// 一个**确定**的 codec 错误（`enchantments` 裸字符串 → 数组；修复前真实客户端
+    /// codec 报 `Not a json array`，与黑紫症状吻合），但修复后用户仍报告黑紫。
+    ///
+    /// 离线复核（真实 1.21.5 / 1.21.10 客户端 codec）：修复后的
+    /// `condition(component, predicate=enchantments)` 在补上 `enchantment` 动态注册表
+    /// （RegistryOps，42 个从 jar 读出的真实附魔 id）后**解析通过**，形状不再是可复现
+    /// 的失败点；但本仓库没有实机渲染验证，用户报告的原因**尚未复现**。因此按用户
+    /// 要求先默认关——这是**产品决策**，不是 codec 硬约束。关闭时两棵 CIT 源目录原样
+    /// 保留；需要的用户在转换页显式打开并自行实机验证。
+    ///
+    /// 这个默认值有代价：CI 里 46 个任务的端到端覆盖不再包含 CIT 那条腿，因此
+    /// `modern_item_definitions_survive_the_whole_pipeline` 显式打开它来守住能力本身；
+    /// 默认值由 `cit_switches_default_to_off_on_off` 单独钉住。
+    ///
+    /// **与 `delete_cit` 同开时以删除为准**：见 [`Self::delete_cit`]。
+    pub convert_cit: bool,
+    /// **是否把两棵 CIT 源目录整个删掉**（默认 **false**，破坏性）。
+    ///
+    /// 为 true 时做两件事，缺一不可：
+    /// 1. **不派发** `generate_cit_item_definitions`（`delete_cit` 优先于
+    ///    [`Self::convert_cit`]——先转一遍再删没有任何意义，只会让日志说谎）；
+    /// 2. 在全部任务之后的清理点把 `assets/minecraft/optifine/cit` 与
+    ///    `assets/minecraft/mcpatcher/cit` 整棵删掉（含显式目录条目）。
+    ///
+    /// 为什么要删而不是只"不转换"：用户实测旧包里的 CIT 在新版本会让客户端加载失败
+    /// （缺失贴图 ⇒ 紫黑格）。只跳过转换时 OptiFine 的源文件还在，装 OptiFine 的
+    /// 客户端仍会读它们并复现同一个失败；只有删掉才能保证"这份包在任何客户端上
+    /// 都不再有 CIT"。
+    ///
+    /// **范围**：只删这两个源根。本任务生成的 `models/cit/**` / `textures/cit/**`
+    /// 不在删除清单里——开关打开时 CIT 任务根本没跑，本次产物不会有它们；而输入包
+    /// 里若已存在上一次转换留下的同名文件，无法与作者自己的素材区分，宁可不碰
+    /// （误删作者素材比留几个孤儿文件更糟）。
+    ///
+    /// **关闭时必须与改动前逐字节相同**：不参与任何任务、不改计划、不改序列化选项，
+    /// 只在为真时多登记一次 tombstone。
+    pub delete_cit: bool,
+    /// **转换产物元数据**（包根 `2pyr-gen.json` 的内容），`None` = 不写（默认）。
+    ///
+    /// ## 为什么放在驱动里，而不是让每个调用方自己在 `tail` 里 `tx.put`
+    ///
+    /// 1. **时机必须与 `pack.mcmeta` 改写同一处**：`tail` 之后才是 Zip 序列化 /
+    ///    Dir 物化，写在这里天然覆盖两条输出路径。如果写成"生产入口写完 zip 再
+    ///    往里塞一个条目"，要么重写 zip、要么漏掉 `Output::Dir`。
+    /// 2. **默认 `None` 是产物不变性质的闸门**：`run_native` 还有 overlay / foray /
+    ///    单测 / `process_extracted_dir_only` 等调用方，它们**一个字节都不该变**。
+    ///    只有生产入口（`version_converter::process_zip_timed`）在用户开启时显式
+    ///    填入（且只对 Java 目标填）。
+    ///
+    /// 内容构造与字段清单见 [`crate::gen_metadata`]；字段清单同时是
+    /// `legal/PRIVACY.md` / `legal/EULA.md` 披露的那一份，改任何一侧都要同步。
+    pub(crate) gen_metadata: Option<crate::gen_metadata::GenMetadata>,
+    pub native: NativeSwitches,
+    /// 原生任务写出声明范围即报错（D12 契约）。关掉则只记录在
+    /// [`MixedRunReport::undeclared`] 里，便于诊断。
+    pub strict_scopes: bool,
+    /// 实验模式：旧任务逐个执行（每个之后收层）。用于验证「同阶段内交错是否等价」。
+    pub legacy_one_by_one: bool,
+    /// **逐步读数**（诊断）：每一步之后记录 workdir 的指纹，写入
+    /// [`MixedRunReport::step_trace`]。默认关闭（对产物无影响）。
+    pub step_trace: bool,
+}
+
+impl Default for MixedRunOptions {
+    fn default() -> Self {
+        Self {
+            limits: SafeLimits::preserving_current(),
+            serialize: SerializeOptions::default(),
+            blob_limit: None,
+            source_version: 34,
+            target_version: 34,
+            run_gui_surgeon: true,
+            fix_alpha_layers: false,
+            adapt_shaders: true,
+            delete_shaders: false,
+            convert_item_definitions: true,
+            // A1 止血（2026-10）：默认关。CIT 的附魔条件可能让 1.21.9+ 的物品定义
+            // 整份解析失败（黑紫格），详见字段注释。
+            convert_cit: false,
+            delete_cit: false,
+            // 元数据默认不写：只有这样，"其它调用方的产物与改动前逐字节相同"
+            // 才不依赖调用方记得传 None。
+            gen_metadata: None,
+            native: NativeSwitches::none(),
+            strict_scopes: true,
+            legacy_one_by_one: false,
+            step_trace: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MixedRunReport {
+    pub materialized_files: usize,
+    pub materialized_dirs: usize,
+    /// 旧任务改动到的条目数（层里的写入数）。
+    pub harvested_changes: usize,
+    pub added: usize,
+    pub modified: usize,
+    pub removed: usize,
+    /// 层写入中落在声明范围之外者（本版传入的声明为 `None`，故为空）。
+    pub undeclared: Vec<String>,
+    /// 本次执行计划里的任务总数（`Scheduler::plan` 的有序名字数）。
+    pub plan_len: usize,
+    /// 其中由 A-ROM 原生执行的个数。
+    pub native_tasks: usize,
+    /// 其中经适配层跑旧闭包的个数。
+    pub legacy_tasks: usize,
+    pub native_names: Vec<String>,
+    /// **原生任务主动跳过的次数**与**原因说明**。
+    ///
+    /// 为什么必须有这两项：任务是"能做就做、做不了就跳过"的，而跳过**本身是对的**
+    /// （例如 OptiFine CIT 用附魔等级触发，1.21.4+ 的物品定义读不到附魔，硬翻会把
+    /// 精确条件放宽成近似条件）。问题在于跳过之后**没有任何人告诉用户**——
+    /// 用户看到的是"转换完了，但自定义外观没生效"，无从判断是没实现还是没条件。
+    ///
+    /// 实测：一份 1.20.1 服务端材质包有 24 条 CIT 规则，全部因条件不可表达而跳过，
+    /// 而这两个字段此前在 `finish_dispatch` 里被直接丢弃，用户一个字的解释都拿不到。
+    pub skipped: usize,
+    pub notes: Vec<String>,
+    /// 原生任务登记的**延迟删除**路径（在清理点统一应用）。
+    pub deferred_removals: Vec<String>,
+    /// **`delete_shaders` 实际删掉的条目数**（0 = 没开，或包里本来没有 shaders）。
+    ///
+    /// 为什么要单独记一个数：这个开关是"删掉产物里的一整块"，而 `removed`/`stats.files`
+    /// 都是全量口径，看不出"到底删了几条"。单测靠它钉住"开启时确实删到了东西"，
+    /// 日志也靠它回答用户"我的包里有 8 条 shaders，已经删了"。
+    pub deleted_shaders: usize,
+    /// **`delete_cit` 实际删掉的条目数**（0 = 没开，或包里本来没有 CIT 源目录）。
+    ///
+    /// 与 `deleted_shaders` 同一个理由：`removed`/`stats.files` 是全量口径，
+    /// 看不出"到底删了几条 CIT"。单测靠它钉住"开启时确实删到了东西"，
+    /// 日志靠它回答用户"包里的 24 条 CIT 规则已经删了"。
+    pub deleted_cit: usize,
+    /// 声明阶段与活注册表不一致的原生任务（见 §9.40：阶段决定相对位置）。
+    pub tier_mismatches: Vec<String>,
+    /// **逐步读数**（诊断，`step_trace` 打开时才填充）：`(标签, 文件数, 总字节, 名字指纹)`。
+    /// 用来回答「分叉是哪一步先发生的」（§9.73）。
+    pub step_trace: Vec<(String, usize, u64, u64)>,
+    pub stats: SerializeStats,
+    /// **管线相位耗时（§9.142）**：驱动内部的粗粒度分段，用于逐步量化优化收益。
+    ///
+    /// 为什么需要它：`ConversionTiming` 只有 `pipeline_s` 一个总数，而任务画像只覆盖任务本身。
+    /// 真实包实测**任务只占流水线的约 13%**（0.76s / 5.8s），剩下 87% 在这些相位里——
+    /// 没有这个分解，任何"优化了多少"都只能靠猜（我也确实因此猜错过两次）。
+    pub phases: PipelinePhases,
+}
+
+/// **管线相位耗时**（§9.142）：秒。全部由 `run_native` 内部打点，单位为秒。
+///
+/// 分段与「什么优化能影响它」一一对应，这样每做一步优化都能立刻看出钱花在哪：
+/// * `open_s`   ← 构造 `Pack`（读输入容器并建索引）
+/// * `materialize_s` ← 把 `Pack` 的视图落到 workdir（任务读盘的前提）
+/// * `tasks_s` ← 全部任务（含并行批的落盘与提交）
+/// * `direct_s` ← `tasks` 之后的直接步骤（`cut_gui_direct`）与延迟删除
+/// * `harvest_s` ← 把 workdir 与基线对比、产出并提交一层（**仅 `Output::Dir`**）
+/// * `tail_s`   ← 调用方传入的收尾步骤（`pack.mcmeta` 改写）
+/// * `output_s` ← 序列化产物（zip 写出或目录物化）
+/// * `other_s`  ← 其余（直接步骤、延迟删除、报告组装等）
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PipelinePhases {
+    pub open_s: f32,
+    pub materialize_s: f32,
+    pub tasks_s: f32,
+    /// `tasks` 之后的**直接步骤**（`cut_gui_direct` 与延迟删除）。Zip 路径上唯一
+    /// 非零的"收尾前"相位——勿与 `harvest_s` 混为一谈（§9.148）。
+    pub direct_s: f32,
+    /// `harvest`：把 workdir 的磁盘差异收成一层。**仅 `Output::Dir` 非零**。
+    pub harvest_s: f32,
+    pub tail_s: f32,
+    pub output_s: f32,
+    pub other_s: f32,
+}
+
+impl PipelinePhases {
+    fn total(&self) -> f32 {
+        self.open_s
+            + self.materialize_s
+            + self.tasks_s
+            + self.direct_s
+            + self.harvest_s
+            + self.tail_s
+            + self.output_s
+            + self.other_s
+    }
+}
+
+
+
+/// **产物去向**（§9.117）。
+///
+/// 存在的理由：生产入口（`version_converter::process_zip_timed`）在管线跑完之后**还要继续
+/// 改工作目录**（写 `pack.mcmeta` 的 `pack_format`、可选的 Bedrock 边任务），最后才重打包。
+/// 因此不能只给生产一个 zip —— 它需要的是**填好的工作目录**。
+///
+/// `Zip` 仍是默认形态（测试与 CLI 走它）；`Dir` 供生产入口使用，
+/// 让 A-ROM 的最终视图**直接物化回工作目录**，从而免掉一次 zip 往返。
+#[derive(Debug, Clone)]
+pub enum Output {
+    Zip(PathBuf),
+    Dir(PathBuf),
+}
+
+
+/// **原生任务派发**（§9.129）：跑一个原生 `Tx` 任务、把层落进 `pack`、并做契约检查。
+///
+/// 抽出来是为了让**同一个任务能在不同的计划槽位执行**：`cut_gui` 必须在批次内的
+/// `(15,18)` 槽位跑（§9.100），而驱动原先只能在「整批旧任务之前/之后」二选一，
+/// 因此它被迫绕道 `Scheduler::run_named` + 注册闭包。
+///
+/// 阶段一致性检查放在这里（原先只在前阶段做）：`decl().tier` 必须与活注册表一致 ——
+/// 阶段决定相对位置，写错会**静默**改变执行顺序（§9.40 的谜题正是这样来的）。
+fn dispatch_native_into_pack(
+    pack: &mut Pack,
+    workdir: &Path,
+    baseline: &mut Materialized,
+    report: &mut MixedRunReport,
+    name: &str,
+    switches: &NativeSwitches,
+    strict_scopes: bool,
+    // §9.144：是否把层镜像到 workdir。仅 `Output::Dir` 需要（Bedrock 边任务与部分单测）。
+    mirror: bool,
+) -> Result<crate::natives::Outcome, AromError> {
+    let (label, decl, run) = native_for(name, switches).expect("dispatched from the plan");
+    // **§9.136：逐任务耗时打点。**
+    //
+    // 驱动按 `plan` 派发 `Tx`，因此这里是**唯一**能覆盖整条计划的位置。打点走的是引擎那边
+    // 同一份 `TaskTiming` 记录（`pack::version_converter` 的 `take_task_timings()` 会取走），
+    // 于是日志里的 `task profile` 不再恒为空、那行 "scheduler+worker overhead"
+    // 也终于只表示真正的收尾开销（此前它把整条流水线的时间都吞了）。
+    //
+    // 计时范围**含收尾**（层落盘 / 契约检查 / 基线同步 / 提交），因为这才是这个任务
+    // 在流水线里的真实占用；只计 `run()` 会低估真正的瓶颈。
+    let started = std::time::Instant::now();
+    let tier_str = decl.tier.as_str();
+    let (outcome, layer) = {
+        let mut tx = pack.tx(name);
+        let outcome = run(&mut tx)
+            .map_err(|e| AromError::internal(format!("native task `{label}` ({name}): {e}")))?;
+        (outcome, tx.into_layer())
+    };
+    if mirror {
+        apply_layer_to_workdir(pack, workdir, &layer)?;
+        check_layer_materialized(pack, workdir, &layer, name)?;
+        // §9.150：基线只服务 `Output::Dir`（harvest 的变更检测）。
+        // Zip 路径上它唯一的读者是报告构造时的 `file_count()`/`dir_count()`，
+        // 那一次在任务循环**之前**就已取值——之后的同步全是白做，
+        // 而每次同步都要 `read_body`（克隆整块字节）+ SHA256。
+        sync_baseline_with_layer(pack, &layer, baseline)?;
+    }
+    pack.commit(layer);
+    // 打点放在**收尾之后**：`started` 起于任务执行前，因此这里记的是该任务在流水线里的
+    // 真实占用（执行 + 层落盘 + 契约检查 + 基线同步 + 提交）。
+    crate::arom::engine::scheduler::record_task_time(
+        name,
+        tier_str,
+        started.elapsed(),
+        false,
+    );
+    finish_dispatch(report, name, outcome)
+}
+
+/// **§9.140：只跑任务体、产出层**——供并行批次使用。
+///
+/// 与 [`dispatch_native_into_pack`] 的区别：它**不碰** workdir / 基线 / pack 的提交，
+/// 因此只需 `&Pack`，可以在同一波次里被多个任务**并发**调用（`Tx` 本就为此设计，
+/// 见 `arom::layer` 的 `into_layer` 文档）。作用域契约检查也在这一步完成——
+/// 它只读层与声明，不依赖任何可变状态。
+fn build_layer_for_task(
+    pack: &Pack,
+    name: &str,
+    switches: &NativeSwitches,
+) -> Result<(crate::natives::Outcome, Layer, bool), AromError> {
+    let (label, decl, run) = native_for(name, switches).expect("dispatched from the plan");
+    let (outcome, layer) = {
+        let mut tx = pack.tx(name);
+        let outcome = run(&mut tx)
+            .map_err(|e| AromError::internal(format!("native task `{label}` ({name}): {e}")))?;
+        (outcome, tx.into_layer())
+    };
+    // §9.131：阶段核对（与串行路径同一套判据）
+    if let Some(live) = crate::task_registry::tier_of(name) {
+        if live.as_str() != decl.tier.as_str() {
+            return Err(AromError::internal(format!(
+                "native task `{label}` ({name}) declares tier `{}` but the live registry says `{}`",
+                decl.tier.as_str(),
+                live.as_str()
+            )));
+        }
+    }
+    // 作用域契约检查：这里**只算不判**——`strict_scopes` 的处理留给调用方
+    // （严格模式要报错，非严格模式要把越界写入记进报告）。这样本函数保持纯只读，
+    // 才能在并行批里被并发调用。
+    let violations = scope_violations(&decl, &layer);
+    // **打点不在这里做。** 并行批次的任务体是并发跑的，这里记的是"墙钟占用"而非该任务
+    // 的真实成本；收尾（落盘/校验/基线/提交）由 `apply_parallel_layers` 串行完成并**统一打点**
+    // 一次。若这里也记一次，同一任务会出现两条记录（实测 46 个任务被记成 61 条），
+    // 让 `task profile` 失去解释力。
+    Ok((outcome, layer, violations.is_empty()))
+}
+
+/// 把一批**已算好的层**按给定顺序落盘并提交（并行批次结束后调用）。
+///
+/// 顺序是计划顺序：并行只发生在"算层"阶段，**提交仍然串行且确定**，
+/// 这样产物与逐任务串行执行完全一致。
+///
+/// **打点口径**：这里记**整批**一条（名字形如 `<tier> 并行批 N 项`），而不是逐任务记。
+/// 原因是并行批的"算层"是并发墙钟、落盘是串行墙钟，两者无法干净地拆到单个任务名下；
+/// 逐任务记会把同一批的时间重复计入每个任务，让 `task profile` 求和**超过**流水线总时长
+/// （实测曾把 46 个任务记成 61 条）。整批一条既准确又可解释。
+/// 逐任务成本仍可从 `--report` 的 profile 与冻结指纹的对比中间接验证。
+fn apply_parallel_layers(
+    pack: &mut Pack,
+    workdir: &Path,
+    baseline: &mut Materialized,
+    report: &mut MixedRunReport,
+    batches: Vec<(String, crate::natives::Outcome, Layer, Vec<String>)>,
+    tier_name: &'static str,
+    batch_started: std::time::Instant,
+    mirror: bool,
+) -> Result<(), AromError> {
+    let n = batches.len();
+    for (name, outcome, layer, violations) in batches {
+        report.undeclared.extend(violations);
+        if mirror {
+            apply_layer_to_workdir(pack, workdir, &layer)?;
+            check_layer_materialized(pack, workdir, &layer, &name)?;
+            sync_baseline_with_layer(pack, &layer, baseline)?;
+        }
+        pack.commit(layer);
+        finish_dispatch(report, &name, outcome)?;
+    }
+    if n > 0 {
+        crate::arom::engine::scheduler::record_task_time(
+            &format!("{tier_name} 并行批（{n} 项，含落盘）"),
+            tier_name,
+            batch_started.elapsed(),
+            true,
+        );
+    }
+    Ok(())
+}
+
+/// 派发收尾：把 `Outcome` 的延迟删除与任务名记进报告（串行与并行两条路径共用），
+/// 并把 `Outcome` 交回调用方。
+fn finish_dispatch(
+    report: &mut MixedRunReport,
+    name: &str,
+    outcome: crate::natives::Outcome,
+) -> Result<crate::natives::Outcome, AromError> {
+    report
+        .deferred_removals
+        .extend(outcome.deferred_removals.iter().cloned());
+    report.native_tasks += 1;
+    report.native_names.push(name.to_string());
+    // 跳过数与原因必须**汇总上报**，否则任务跳过了什么用户永远不知道（见字段注释）。
+    report.skipped += outcome.skipped;
+    report.notes.extend(outcome.notes.iter().cloned());
+    Ok(outcome)
+}
+
+
+/// **驱动**：按 `Scheduler::plan` 的顺序逐任务执行，每个任务派发一笔 `Tx`，
+/// 实现来自 [`crate::natives`]（46 个全部原生，**无适配层、无旧闭包**）。
+///
+/// ## 两条输出路径
+///
+/// * [`Output::Zip`]（Java 目标，生产默认）：**全内存**——不物化 workdir、不 harvest，
+///   任务层层提交进 `Pack`，最后由 [`write_zip`] 直接从 `Pack` 序列化。因此
+///   `workdir` 与 `tail` 在这条路上**不参与产物**。
+/// * [`Output::Dir`]：才需要「目录镜像」——把层落到 `workdir`、用 `harvest` 把差异收成层，
+///   让磁盘目录与对象模型保持一致；`tail` 用于收尾步骤（例如 `pack.mcmeta` 改写）。
+///
+/// 两条路必须产出**逐项一致**的条目集，这正是本模块末尾用例的验收方式。
+pub fn run_native<F>(
+    input: &Path,
+    workdir: &Path,
+    output: &Output,
+    opts: &MixedRunOptions,
+    tail: F,
+) -> Result<MixedRunReport, AromError>
+where
+    F: FnOnce(&mut crate::arom::Tx<'_>) -> Result<(), String>,
+{
+    use crate::arom::engine::scheduler::Scheduler;
+
+    ensure_empty_dir(workdir)?;
+
+    // **§9.142：相位打点。** 每段一个 `Instant`，末尾汇总进 `report.phases`。
+    // 这是逐步量化优化的唯一可信依据（`pipeline_s` 太粗、任务画像只覆盖任务本身）。
+    let mut phases = PipelinePhases::default();
+    let pipeline_clock = std::time::Instant::now();
+    let mut clock = pipeline_clock;
+
+    // **§9.145：输入可以是 zip，也可以是已解压的目录树。**
+    //
+    // 判据是文件类型而不是新参数：调用方本来就同时在用两种形态，类型判断可以避免
+    // 每个调用点都要多传一个"我这是目录"的布尔。`Pack::open_dir` 走 `DirSource`。
+    //
+    // **注意：生产入口目前仍传 zip**，因为实测"直接吃预检解压好的树"在本包上**更慢**
+    // （纯转换 0.44 → 0.63s），详见 `version_converter.rs` 里 §9.145 的实测记录。
+    // 这个分支仍有价值：单测与第三方调用方可以用目录形态，且 `DirSource` 有单测覆盖。
+    let mut pack = if input.is_dir() {
+        Pack::open_dir(input, &opts.limits, opts.blob_limit)?
+    } else {
+        Pack::open_zip(input, &opts.limits, opts.blob_limit)?
+    };
+    phases.open_s = clock.elapsed().as_secs_f32();
+    clock = std::time::Instant::now();
+
+    // **§9.155：管线一开始就把 `pack.mcmeta` 写成目标格式。**
+    //
+    // ## 修的是什么
+    //
+    // `adapt_java_shaders`（§9.85）与 1.21.4+ 物品定义两项都**从包里读目标格式**：
+    //
+    // ```ignore
+    // let target = tx.view().mcmeta().ok().and_then(|m| m.effective_format()).unwrap_or(88);
+    // ```
+    //
+    // §9.85 的注释论证过这是安全的，理由是"驱动的收尾步骤把同一个 `target_version`
+    // 写进 `pack.mcmeta`（`write_pack_format`），所以从包里读出的值与传进来的那个是**同一个数**"。
+    // **那段论证是错的，实测反例就在眼前**：收尾写 `pack.mcmeta` 的是传给 `run_native` 的
+    // `tail` 回调，而它在**全部任务之后**才跑（本函数末尾的 `tail(&mut tx)`）。
+    // 于是**任务执行期间**包里的 `pack.mcmeta` 仍然是**源**格式。
+    //
+    // 实测（本次新增的 `modern_item_definitions_survive_the_whole_pipeline` 抓出）：
+    // fixture 源格式 34、目标 55，`generate_item_definitions` 里读到的目标是 **34**，
+    // 于是 `target < 46` 分支把整个任务空转掉——产物里一个 `items/*.json` 都没有，
+    // **全程没有任何错误或警告**。这正是"最坏的失败形态"。
+    //
+    // ## 为什么改成"管线开始时写成目标格式"
+    //
+    // 任务**需要**的是目标格式（它们在做目标格式的适配），而源格式在开始转换那一刻
+    // 就已经不再有意义——转换的定义就是"把源格式的包改成目标格式的包"。
+    // 把 `pack.mcmeta` 提前定成目标格式，让「任务读到的格式」与「`NativeContext` 里的
+    // `target_pack_format`」**恒等**，而不是靠"两处恰好会写成一样"这种巧合。
+    //
+    // ## 为什么不改驱动签名
+    //
+    // 备选方案是把 `target_version` 透传进执行体。但 `native_for` 有约 45 个返回点，
+    // 每个都要多带一个参数（§9.84 已经因为同类改动两次编译不过）；而本方案只动**一处**，
+    // 且顺带把 §9.85 那条"靠巧合正确"的论证换成了一条**结构性**保证。
+    //
+    // ## 产物是否变化
+    //
+    // 收尾的 `tail` 回调**照旧**把 `pack.mcmeta` 改成目标格式，因此**最终产物逐字节不变**。
+    // 中间态多了这一层写入，但没有任何序列化发生在它之前。
+    // 这一点由全套夹具闸门把关（内容指纹用例只报告，不再判定）。
+    if opts.target_version != opts.source_version
+        && pack.view().resolve("pack.mcmeta").is_some()
+    {
+        let mut tx = pack.tx("pin-target-format");
+        if let Ok(current) = tx.text("pack.mcmeta") {
+            if let Ok(next) =
+                crate::pack::version_converter::rewrite_pack_mcmeta_text(&current, opts.target_version)
+            {
+                tx.put("pack.mcmeta", next.into_bytes())?;
+                let layer = tx.into_layer();
+                pack.commit(layer);
+            }
+        }
+    }
+    phases.open_s += clock.elapsed().as_secs_f32();
+    clock = std::time::Instant::now();
+    // **§9.144：workdir 只在 `Output::Dir` 时才是真源。**
+    //
+    // `Output::Zip` 由 `write_zip` 直接从 `pack` 视图序列化，**从不读 workdir**；
+    // `Output::Dir` 需要一棵可继续被 Bedrock 边任务（与部分单测）使用的磁盘树，
+    // 因此仍保留"逐层镜像到 workdir"的旧行为。
+    //
+    // Zip 路径下因此可以整段省掉：不再物化（1.6s）、不再逐层落盘、不再收获。
+    let mirror = matches!(output, Output::Dir(_));
+    let mut baseline = {
+        let view = pack.view();
+        if mirror {
+            materialize(&view, workdir)?
+        } else {
+            // **§9.147**：Zip 路径不需要变更检测基线（没有 harvest），只数条目与目录。
+            // 原先这里调 `baseline_of`，它对全部 3631 条做 read + SHA256（实测 0.222s，
+            // 即整包解压一遍），而那份指纹在这条路径上**没有任何读者**。
+            crate::arom::pathview::baseline_counts_only(&view)?
+        }
+    };
+    phases.materialize_s = clock.elapsed().as_secs_f32();
+    clock = std::time::Instant::now();
+
+    let scheduler = Scheduler::new();
+    let planned = scheduler
+        .plan(opts.source_version, opts.target_version)
+        .map_err(|e| AromError::internal(format!("scheduler plan: {e}")))?;
+    // ══════════════════════════════════════════════════════════════════════
+    // **物品定义 / CIT 三个用户开关：在计划阶段过滤任务**。
+    //
+    // 为什么在计划阶段、而不是在任务体内早退：
+    //
+    // 1. 这两个任务（`generate_item_definitions` / `generate_cit_item_definitions`）
+    //    都带**副作用**（写 `items/`、`models/cit/`、`textures/cit/`），"不跑"
+    //    与"跑了但什么都没写"在用户眼里一样，在日志/任务画像里却不一样——后者会
+    //    让用户看到一条正常的任务记录，然后疑惑"为什么没生效"。
+    // 2. `plan_len` / `native_names` 的口径是"本次执行计划里的任务"，过滤后它们
+    //    与实际执行数一致；否则 `native_tasks + legacy_tasks == plan_len` 这条
+    //    不变式还在，但计划里会留下永远不执行的名字（§9.140 的并行分桶也会多算）。
+    // 3. 过滤发生在 `native_placements` **之前**，因此不会留下"被判为 Early 但
+    //    从未执行"的条目；这与"任务自己按开关跳过"的产物完全等价（它本来也
+    //    不写任何字节），只是读数更诚实。
+    //
+    // 过滤规则三条：
+    //   * `convert_item_definitions == false` ⇒ 去掉 `generate_item_definitions`；
+    //   * `convert_cit == false` **或** `delete_cit == true` ⇒ 去掉
+    //     `generate_cit_item_definitions`。
+    //     **`delete_cit` 优先**：删除就是删除，不存在"先转一遍再删"。
+    //   * `adapt_shaders == false` ⇒ 去掉 `adapt_java_shaders`。
+    //     这条是**修回归**：M3 换计划表之后这个开关只被传递、没有消费者，
+    //     见 `plan_task_enabled` 的文档。
+    //
+    // 默认组合（convert_item_definitions=true / convert_cit=false / delete_cit=false /
+    // adapt_shaders=true）下 **CIT 任务默认不派发**：这是 2026-10 的 A1 止血改动
+    // （理由见 `MixedRunOptions::convert_cit` 的字段注释）。其余两条过滤在默认下是
+    // 恒等，因此"不加新选项时产物与改动前一致"仍成立——差异只来自这个有意的默认值，
+    // 由 `cit_switches_default_to_off_on_off` 与 `cit_and_item_definition_switches_gate_only_their_own_output`
+    // 两条用例直接钉住。
+    // ══════════════════════════════════════════════════════════════════════
+    let planned_len = planned.len();
+    let plan: Vec<String> = planned
+        .into_iter()
+        .filter(|name| plan_task_enabled(name, opts))
+        .collect();
+    if plan.len() != planned_len {
+        // 用户能看到"计划被改过"的唯一入口：日志里逐条说明被过滤的任务。
+        // 不把这条写进 report.notes（那是**任务**的说明），因为没有任务跑过；
+        // 产物差异靠上面的 `convert_*` 日志行也能解释。
+        crate::log_info!(
+            "conversion switches: {} 个物品定义任务未派发（convert_item_definitions={}, convert_cit={}, delete_cit={}）",
+            planned_len - plan.len(),
+            opts.convert_item_definitions,
+            opts.convert_cit,
+            opts.delete_cit
+        );
+    }
+
+    // §9.93（M3）：包名与旧管线**同源**——`invoke_conversion_ex` 也是取
+    // `target_path.file_stem()`（`target_path` 即输入包）。这样 Bedrock 任务在两条路径上
+    // 看到同一个包名，产出的 `.mcpack` 文件名一致。
+    let pack_name = input
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("resource_pack");
+    let mut report = MixedRunReport {
+        materialized_files: baseline.file_count(),
+        materialized_dirs: baseline.dir_count(),
+        plan_len: plan.len(),
+        ..MixedRunReport::default()
+    };
+    // **Android 适配点（进度）**：pipeline 段 0.12–0.90，分母 = 过滤后的计划长度
+    // `plan_len`（与 `report.plan_len` 同口径）。`done` 只增不减；并行批整批提交后
+    // 一次性累加。单调钳制/节流由 `crate::progress` 统一负责。
+    let progress_total = plan.len();
+    let mut progress_done = 0usize;
+    // **逐步读数**（诊断，§9.73）：局部累积，末尾一次性写入报告（避免借用冲突）
+    let mut trace: Vec<(String, usize, u64, u64)> = Vec::new();
+    let trace_step = |label: &str, trace: &mut Vec<(String, usize, u64, u64)>| {
+        if opts.step_trace {
+            let (files, bytes, hash) = digest_workdir(workdir);
+            trace.push((label.to_string(), files, bytes, hash));
+        }
+    };
+
+    // ① 原生前阶段：只放「按语义就该最先跑」的任务（当前批次都是 Eraser 阶段的删除/改名）。
+    //
+    // 为什么不做「逐任务交错」：实测证明按名字逐个跑旧闭包与生产**不等价**
+    // （真实包上 105 个文件差异——`TexturePool` 的提交时机、延迟清理与阶段内并行分组
+    // 相互耦合）。一次性批量执行旧任务则与生产逐字一致，因此把风险关在这一侧。
+    //
+    // **放置规则（§9.52 再次修正）**：旧批次不可拆分（§9.42），因此每个原生任务只能在
+    // 「整批旧任务之前」或「之后」二选一。选哪一侧**由依赖关系决定**，而不是由阶段名比较
+    // 决定（§9.49 的阶段比较在 `generate_smithing_ui` 上给了错答案：它的阶段 Architect
+    // 高于旧批次里的 Eraser，于是被放到旧批次之后，结果**晚于**计划中消费它输出的
+    // Surgeon 旧任务，顺序被反转）。判据：
+    //
+    // > 与某原生任务**有重叠**的旧任务，若在计划里排在它**之后**，该原生任务必须放前阶段
+    // > （否则那一步会读到原生改动后的内容）；若排在它**之前**，则必须放后阶段
+    // > （它自己必须读到旧任务的改动）。两侧都要求时属**歧义**，放后阶段并记录待裁决。
+    // **① 前置原生任务**（`Side::Early`）：这一批必须**先于**计划里的自然位置执行。
+    //
+    // 这不是历史包袱，而是 §9.52/§9.100 实测出来的**必要前置**：名单里的任务都是
+    // 「原位改写 GUI 图」或「生成 GUI 图」，而计划中消费它们的任务在计划里排得更早 ——
+    // 若按计划顺序跑，`convert_animated_textures` 会**先于** `fix_clock_compass`，
+    // 于是它把 `clock.png` 拆成 `clock_00..63` 并删掉原图，随后 `fix_clock_compass`
+    // 再也找不到 `clock.png`。
+    //
+    // **这是 §9.129 实测到的**：把前置删掉、改成纯计划顺序后，产物条目 4018 → **4117**，
+    // 指纹 `0x75bb3260e7f578a6` → `0xbbbf2f19b473817c`；逐条 diff 显示
+    // **多 105 条** `textures/item/*`（`clock_00..63`、`acacia_boat.png` …）、
+    // **少 6 条**原图（`clock.png`、`clock.png.mcmeta`、`compass.png`、`compass.png.mcmeta`、
+    // `entity/equipment/humanoid{,_leggings}/copper.png`）。恢复前置后指纹回到冻结值。
+    let native_placements = native_placements(&plan, &opts.native);
+    let early_natives: Vec<String> = plan
+        .iter()
+        .filter(|name| matches!(native_placements.get(*name), Some(Side::Early)))
+        .cloned()
+        .collect();
+    for name in &early_natives {
+        if native_for(name, &opts.native).is_none() {
+            return Err(AromError::internal(format!(
+                "plan lists task `{name}` but no native implementation is registered \
+                 (legacy execution has been removed, §9.129)"
+            )));
+        }
+        let outcome = dispatch_native_into_pack(
+            &mut pack,
+            workdir,
+            &mut baseline,
+            &mut report,
+            name,
+            &opts.native,
+            opts.strict_scopes,
+            mirror,
+        )?;
+        report
+            .deferred_removals
+            .extend(outcome.deferred_removals.iter().cloned());
+        trace_step(&format!("pre:{name}"), &mut trace);
+        progress_done += 1;
+        crate::progress::pipeline_progress(progress_done, progress_total, name);
+    }
+
+    // **② 逐任务执行**（§9.129）。
+    //
+    // 历史上这里分三段：原生「前阶段」→ 旧任务**一次性批次**（`Scheduler::run_named`）
+    // → 原生「后阶段」。批次之所以整体喂给旧引擎，是因为 §9.42 实测「旧批次不可拆分」
+    // （一次提交 + 一次清理），于是每个原生任务只能在批次**之前或之后**二选一
+    // （`native_placements` 的 `Side::Early/Late`）。
+    //
+    // §9.128 送走旧转换器后，46 个任务**全部**是原生 `Tx`；
+    // §9.129 又把 `cut_gui` 也并入派发表（它原先绕道注册闭包，就为了能跑在批次内部）。
+    // 于是批次里**一个名字都不剩**，"不可拆分"这个约束随之消失 ——
+    // 现在按 `plan` 顺序**逐任务**执行即可，每个任务都跑在它的**精确计划槽位**上
+    // （前置那一批已在 ① 跑过，这里跳过）。
+    //
+    // 判据是冻结指纹（§9.129 实测：4018 条目 / `0x75bb3260e7f578a6`）。
+    //
+    // **§9.140：恢复并行（按阶段分批）。**
+    //
+    // 旧引擎在同一 tier 内把 `TaskType::Parallel` 的任务用 `rayon` 并发跑，`Hybrid`/`Exclusive`
+    // 仍然串行（`engine/scheduler.rs` 的 `execute_parallel_capable_tier`：先并行批、后串行）。
+    // §9.129 改逐任务派发后这层并行**丢失**了，实测真实包 46 个任务体从 1.48s 涨到 3.48s。
+    //
+    // 这里按同一套语义恢复：`plan` 已按 tier 有序，因此连续切出「同 tier 段」，
+    // 段内再按类型分成并行批与串行批。
+    //
+    // **关键在于并行只作用于"算层"**：`Tx` 只持 `&Pack`（`into_layer` 的文档明说
+    // "同一波次的任务可以并发持事务"），因此批内任务可以并发产出各自的 `Layer`；
+    // 而**落盘与提交仍然串行、且顺序 = 计划顺序**，产物与逐任务串行执行一致。
+    // 判据同前：冻结指纹。
+    let plan_rest: Vec<String> = plan
+        .iter()
+        .filter(|n| !early_natives.contains(n))
+        .cloned()
+        .collect();
+
+    // 契约检查：计划里的每个名字都必须有原生实现。**这是永久不变式**——全部 46 个任务
+    // 都是原生实现，且已无旧执行路径可回落（§9.129 起）。因此本条真正防的是"往计划表里
+    // 加了一个没有实现的名字"：必须显式失败，而不是静默跳过该任务、产出错误结果。
+    for name in &plan_rest {
+        if native_for(name, &opts.native).is_none() {
+            return Err(AromError::internal(format!(
+                "plan lists task `{name}` but no native implementation is registered \
+                 (legacy execution has been removed, §9.129)"
+            )));
+        }
+    }
+
+    // 切成「同 tier 段」——`plan` 按 tier 有序，因此只需比较相邻任务的 tier。
+    let mut tiers: Vec<(Tier, Vec<String>)> = Vec::new();
+    for name in plan_rest {
+        let tier = crate::task_registry::tier_of(&name).unwrap_or(Tier::Eraser);
+        match tiers.last_mut() {
+            Some((t, v)) if *t == tier => v.push(name),
+            _ => tiers.push((tier, vec![name])),
+        }
+    }
+
+    for (tier, names) in tiers {
+        // 段内分桶：`Parallel` 并发，其余串行；并行的先跑（与旧引擎一致）。
+        let (parallel, serial): (Vec<String>, Vec<String>) = names
+            .into_iter()
+            .partition(|n| {
+                matches!(
+                    crate::task_registry::lookup(n).map(|m| m.task_type),
+                    Some(crate::arom::engine::scheduler::TaskType::Parallel)
+                )
+            });
+
+        if !parallel.is_empty() {
+            let batch_started = std::time::Instant::now();
+            // 并发算层（只读 `&Pack`）
+            let built: Vec<Result<(String, crate::natives::Outcome, Layer, Vec<String>), AromError>> =
+                {
+                    use rayon::prelude::*;
+                    parallel
+                        .par_iter()
+                        .map(|name| {
+                            let (outcome, layer, clean) =
+                                build_layer_for_task(&pack, name, &opts.native)?;
+                            let violations = if clean {
+                                Vec::new()
+                            } else {
+                                // 非严格模式：把越界写入记进报告（与串行路径同一语义）
+                                let v = scope_violations(
+                                    &native_for(name, &opts.native).expect("checked above").1,
+                                    &layer,
+                                );
+                                // 严格模式：越界即失败——与串行路径同一判据
+                                if opts.strict_scopes && !v.is_empty() {
+                                    return Err(AromError::internal(format!(
+                                        "native task `{name}` wrote outside its declared scope: {v:?}"
+                                    )));
+                                }
+                                v
+                            };
+                            Ok((name.clone(), outcome, layer, violations))
+                        })
+                        .collect()
+                };
+            let mut batches = Vec::with_capacity(built.len());
+            for r in built {
+                batches.push(r?);
+            }
+            // 串行落盘 + 提交（顺序 = 计划顺序，即 `parallel` 的原有次序）
+            apply_parallel_layers(
+                &mut pack,
+                workdir,
+                &mut baseline,
+                &mut report,
+                batches,
+                tier.as_str(),
+                batch_started,
+                mirror,
+            )?;
+            for name in &parallel {
+                trace_step(name, &mut trace);
+            }
+            // Android 适配点（进度）并行批：整批提交后按批累加；phase 用阶段名
+            // （并行算层阶段无法把完成时机干净拆到单个任务名下）。
+            progress_done += parallel.len();
+            crate::progress::pipeline_progress(progress_done, progress_total, tier.as_str());
+        }
+
+        for name in &serial {
+            let outcome = dispatch_native_into_pack(
+                &mut pack,
+                workdir,
+                &mut baseline,
+                &mut report,
+                name,
+                &opts.native,
+                opts.strict_scopes,
+                mirror,
+            )?;
+            report
+                .deferred_removals
+                .extend(outcome.deferred_removals.iter().cloned());
+            trace_step(name, &mut trace);
+            progress_done += 1;
+            crate::progress::pipeline_progress(progress_done, progress_total, name);
+        }
+        let _ = tier;
+    }
+    report.legacy_tasks = 0;
+    phases.tasks_s = clock.elapsed().as_secs_f32();
+    clock = std::time::Instant::now();
+
+    // **§9.144：这里原本有一次 `harvest`，已删除。**
+    //
+    // `harvest` 的语义是「把 workdir 与基线对比，把磁盘上的差异收成一层」。它存在的前提是
+    // 任务把 workdir 当真源、在磁盘上改文件。而 §9.128/§9.129 之后 46 个任务全是 `Tx`，
+    // 收尾步骤（`cut_gui_direct`、延迟删除、`tail`）也都已改为包原生，workdir 在转换期间
+    // **没有任何读者**，因此本轮不再物化它（见上方 `baseline_of` 的说明）。
+    //
+    // 保留这次 harvest 的后果**实测过**：workdir 是空目录，harvest 把基线里全部文件
+    // 判为"已删除"，产出一个删除层——产物从 4018 条目掉到 **3654**
+    // （指纹 0xeeddcdc1806f7d1a ≠ 0x75bb3260e7f578a6）。
+    //
+    // 删除它是**语义上正确**的：驱动现在每一步都直接提交进 `pack`，pack 的视图
+    // 就是最终状态，不存在"只存在于磁盘、尚未进包"的改动需要收获。
+    //
+    // **§9.148：这里不要写 `phases.harvest_s = 0.0;`。** 它本来就由
+    // `PipelinePhases::default()` 初始化为 0；而在这个位置写一句会**掩盖计时 bug**：
+    // 紧随其后的"直接步骤 + 延迟删除 + tail"会被算进 `harvest` 相位
+    // （实测 Zip 路径上出现 `harvest 0.07s`，而该路径根本不跑 harvest）。
+    // 计时器 `clock` 在上一段末尾已重置，删掉这句后各相位才各归其位。
+
+    // 注册表之外的直接步骤（GuiSurgeon sprite 手术）——生产管线在任务之后、
+    // 清理之前执行它；漏掉它会整片丢失 sprite 产物（本步实测：真实包少了 3861 个文件）。
+    //
+    // 注意它**依然执行**（不是被计划里那次 `cut_gui` 取代）：§9.90/§9.91 实测过，
+    // 计划内的 `cut_gui` 与这里的这步**各自都是必需的**，删任何一个都会丢 sprite。
+    // 区别只在**输入状态**（本步在全部任务之后），不在实现——两者都调 `gui_surgeon_tx::run`。
+    //
+    // **§9.135：本步改为 pack 原生**（原先经 `surgeon_cut_gui::run_in_workdir`，那层
+    // "读 gui 子树 → 建内存包 → 写回磁盘"的桥已整体删除）。
+    //
+    // **保留旧实现的两个门槛**（Bedrock 中间态跳过 sprite 手术，避免干扰 j2b；目标 < 34 也跳过）：
+    let direct_started = std::time::Instant::now();
+    if opts.run_gui_surgeon && opts.target_version >= 34 {
+        let (outcome, layer) = {
+            let mut tx = pack.tx("cut_gui_direct");
+            let outcome = crate::natives::gui_surgeon_tx::run(&mut tx)
+                .map_err(|e| AromError::internal(format!("direct steps: {e}")))?;
+            (outcome, tx.into_layer())
+        };
+        // 与其它原生任务同一套收尾：基线同步 → 提交进 pack。
+        // §9.144：层落 workdir 只在 `Output::Dir` 时需要（Zip 路径直接从 pack 序列化）。
+        if mirror {
+            apply_layer_to_workdir(&pack, workdir, &layer)?;
+            check_layer_materialized(&pack, workdir, &layer, "cut_gui_direct")?;
+            // §9.150 的遗漏补齐：基线只服务 harvest 的变更检测，Zip 路径没有 harvest。
+            // 逐任务那两处当时已条件化，这里漏了——而本步写 209 条，
+            // 每条都要 `read_body`（克隆整块字节）+ SHA256。
+            sync_baseline_with_layer(&pack, &layer, &mut baseline)?;
+        }
+        pack.commit(layer);
+        report.deferred_removals.extend(outcome.deferred_removals);
+    }
+    trace_step("after-direct-steps", &mut trace);
+
+    // ══════════════════════════════════════════════════════════════════════
+    // **`delete_shaders`：把 shaders 整棵删掉**（用户开关，默认关）。
+    //
+    // ## 做什么
+    //
+    // 删**两个根**，两个都要删，因为它们的来源不同：
+    //   * `assets/minecraft/shaders` —— 自定义 **core 着色器**（改 GUI/文字渲染的地方），
+    //     也是 `adapt_java_shaders` 唯一处理的那棵树；
+    //   * `shaders/`（包顶层）—— OptiFine / Iris **光影包**的落点，`adapt_java_shaders`
+    //     **完全不碰**它（它的 `SHADERS` 常量是 `assets/minecraft/shaders`），
+    //     所以"适配"救不了这类包，只能整删。
+    //
+    // 用 `tx.remove()` 登记 tombstone：层对**子树**生效（`Layer::lookup` 连祖先一起判、
+    // `entries_uncached` 里 `map.retain(!is_under)`），因此一个前缀就能带走目录里全部文件；
+    // 包若带**显式目录条目**（真实包实测：`assets/minecraft/shaders/` 与
+    // `.../shaders/core/` 都是独立 zip 条目），精确命中同样会被移除。
+    //
+    // ## 为什么放在这个位置（时序是这个功能的**全部难点**）
+    //
+    // 这里正是既有**延迟删除的清理点**（下面那段 `deferred_removals`）：全部任务 +
+    // `cut_gui_direct` 之后、`harvest` 与 `tail` 之前。三个理由，每一个都有实测教训：
+    //
+    // 1. **不能更早**：`adapt_java_shaders` 在计划里出现十几次（每条着色器边界一次），
+    //    它的 `walk_dir` 每轮都 `tx.list(SHADERS)`。若在任务阶段中途删掉，后续那几轮会
+    //    静默看到"空目录"——不报错、不提示，`Outcome.changed` 直接归零。这不是"反正要删，
+    //    早删无所谓"能解释的：日志会说话，而它说的话是假的。
+    // 2. **不能晚于 `harvest`**（`Output::Dir` 路径）：`harvest` 拿 workdir 与基线对比产出
+    //    一层。若先 harvest 再删，删除只落在 `pack` 上、磁盘上的 shaders 还在，二者不一致；
+    //    而这条路径的目录接下来还要被 Bedrock 边任务读（`j2b` 的
+    //    `adapt_java_shaders_for_bedrock` 会读 `assets/minecraft/shaders` 并搬到
+    //    `shaders/glsl|hlsl`）——删在 harvest 之后等于**没删**。
+    // 3. **不能晚于 `tail`**：`tail` 之后就是 `write_zip`/`materialize`，是产物的定义；
+    //    在那里插一步会让"产物 = 视图"这条不变量多出一个例外。
+    //
+    // 复用清理点（而不是新写一层）还有一个白拿的好处：`apply_layer_to_workdir` +
+    // `sync_baseline_with_layer` 已经在这条路径上处理了「层 → 磁盘 → 基线」三者同步，
+    // 我只要把两个前缀塞进 `report.deferred_removals` 即可，不必再抄一遍。
+    //
+    // ## 关闭时与改动前逐字节相同
+    //
+    // 只有 `opts.delete_shaders == true` 才进入本段；默认 false 时这段**一条语句都不执行**
+    // （不建事务、不提交层、不改 report），下面的清理点看到的输入与改动前完全一样。
+    // 包本来就没有 shaders 时同样不登记（`deleted_shaders` 保持 0，产物不变）——
+    // 真实包实测（`[Java 26.3]TapL 16x.zip`，4138 条目）里根本没有 `shaders/`。
+    //
+    // ## Bedrock 目标（`--to 1000`）的**连带效果**（不是 bug，但必须写下来）
+    //
+    // Bedrock 目标先转 Java 26.3（97）再跑 j2b，而删除发生在**Java 中间态**：j2b 里的
+    // `bedrock_convert::shaders::adapt_java_shaders_for_bedrock` 读不到
+    // `assets/minecraft/shaders`，会在第一个判断就返回——于是 **`shaders/glsl|hlsl`
+    // 与引用它们的 `materials/*.material` 都不会生成**。实测（源 15 → 目标 1000，开/关各一次）：
+    // 858 → 834 条目，少的 24 条全是 `shaders/**` 与 `materials/**`（材质桩只被着色器引用，
+    // 没有 shaders 时它们就是悬空引用）。因此这个开关在 Bedrock 目标上删的**不止两个根**。
+    // 想要"删顶层光影但保留 Bedrock 材质桩"的用户不适用本开关——这条边界写在这里，
+    // 免得后来的人以为是漏删或多删。
+    // ══════════════════════════════════════════════════════════════════════
+    if opts.delete_shaders {
+        // 先数一遍：既用于"存在才登记"（避免给不存在的路径留 tombstone），
+        // 也用于日志与报告里的"删掉了几条"。这次 `entries()` 走包级缓存。
+        let entries = pack.view().entries()?;
+        let mut total = 0usize;
+        let mut hits: Vec<&'static str> = Vec::new();
+        for root in SHADER_ROOTS {
+            let n = entries
+                .iter()
+                .filter(|e| e.path == *root || e.path.starts_with(&format!("{root}/")))
+                .count();
+            if n > 0 {
+                hits.push(root);
+                total += n;
+            }
+        }
+        report.deleted_shaders = total;
+        if hits.is_empty() {
+            crate::log_info!("delete_shaders: 包内没有 shaders 目录，跳过（产物不受影响）");
+        } else {
+            report.deferred_removals.extend(hits.iter().map(|s| s.to_string()));
+            crate::log_info!(
+                "delete_shaders: 将在清理点删除 {} 条 shaders 条目（{}）—— 自定义光影将不再生效",
+                total,
+                hits.join(", ")
+            );
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // **`delete_cit`：把两棵 CIT 源目录整棵删掉**（用户开关，默认关）。
+    //
+    // ## 做什么
+    //
+    // 删两个根，两个都要删，因为来源不同：
+    //   * `assets/minecraft/optifine/cit` —— 现行 OptiFine CIT 的落点；
+    //   * `assets/minecraft/mcpatcher/cit` —— 1.7 时代的旧名字，老包仍在用。
+    //     **现代转换路径不经过 `(7,8)` 的 `rename_mcpatcher_to_optifine`**
+    //     （34→55 走的是 34→42→46→55），所以这个根会原样留到产物里——只删
+    //     `optifine` 那一棵等于对老包完全没有效果（实测：布吉岛包里 24 条规则
+    //     全在 `optifine/cit`，但 `mcpatcher/cit` 的包同样存在）。
+    //
+    // 用 `tx.remove()` 登记 tombstone：层对**子树**生效（`Layer::lookup` 连祖先
+    // 一起判、`entries_uncached` 里 `map.retain(!is_under)`），因此一个前缀就能
+    // 带走目录里全部文件；包若带**显式目录条目**（真实包实测：`optifine/cit/`
+    // 与 `.../cit/bow0/` 都是独立 zip 条目），精确命中同样会被移除。
+    //
+    // ## 位置与 `delete_shaders` 完全相同（全部任务之后、清理点之前）
+    //
+    // 理由逐条相同（见上一段），额外多一条**本开关专属**的理由：
+    // `delete_cit == true` 时 `generate_cit_item_definitions` **已经在计划阶段被
+    // 过滤掉**（见 `plan_task_enabled`），所以这里删源文件不会让任何任务看到空目录。
+    // 若将来有人把过滤挪回任务体内，就必须保持"跳过"发生在删除之前——反过来
+    // （先删再跳过）在产物上其实等价，但任务会读到空目录并把 `changed` 记成 0，
+    // 日志里就分不清"没规则"和"规则被删了"。
+    //
+    // ## 关闭时与改动前逐字节相同
+    //
+    // 只有 `opts.delete_cit == true` 才进入本段；默认 false 时这段**一条语句都不
+    // 执行**（不建事务、不提交层、不改 report）。包本来就没有 CIT 时同样不登记
+    // （`deleted_cit` 保持 0，产物不变）。
+    // ══════════════════════════════════════════════════════════════════════
+    if opts.delete_cit {
+        let entries = pack.view().entries()?;
+        let mut total = 0usize;
+        let mut hits: Vec<&'static str> = Vec::new();
+        for root in CIT_ROOTS {
+            let n = entries
+                .iter()
+                .filter(|e| e.path == *root || e.path.starts_with(&format!("{root}/")))
+                .count();
+            if n > 0 {
+                hits.push(root);
+                total += n;
+            }
+        }
+        report.deleted_cit = total;
+        if hits.is_empty() {
+            crate::log_info!("delete_cit: 包内没有 CIT 源目录，跳过（产物不受影响）");
+        } else {
+            report.deferred_removals.extend(hits.iter().map(|s| s.to_string()));
+            crate::log_info!(
+                "delete_cit: 将在清理点删除 {} 条 CIT 条目（{}）—— OptiFine 与新版物品定义都不会再生效",
+                total,
+                hits.join(", ")
+            );
+        }
+    }
+
+    // **§9.129：`ctx.execute_cleanup()` / `pool.clear_unused()` 已删除。**
+    //
+    // 原先这里调用旧引擎的清理：旧任务的 `defer_remove_*` 登记在 `HurrayContext` 的清单里，
+    // 生产管线在 `invoke_conversion_ex` 末尾统一执行（漏掉会让 `assets/minecraft/font`
+    // 之类的目录在产物里复活）。
+    //
+    // 现在两件事都不需要了：
+    //   * `cut_gui` 是**最后一个**往 `ctx` 登记清理的东西（§9.128 已改成回传 `Outcome`）；
+    //   * 计划里的 46 个任务**全部**是原生 `Tx`，没有旧闭包会去 `ctx.defer_remove_*`；
+    //   * `TexturePool` 也只被旧闭包用过。
+    //
+    // 于是 `ctx` 恒为空、`pool` 恒为空转 —— 保留它们只会让"这里还有旧引擎在做事"的假象留存。
+    // 所有延迟删除现在只有一条路径：下方 `report.deferred_removals` 的 tombstone。
+
+    // 原生任务登记的**延迟删除**：与旧实现的 `defer_remove_*` **同一时机**（清理点）统一应用。
+    // 早删会让更晚的任务看不到文件（实测：反向改名搬不动已被删的源，§9.23）。
+    if !report.deferred_removals.is_empty() {
+        let deferred = std::mem::take(&mut report.deferred_removals);
+        let layer = {
+            let mut tx = pack.tx("deferred-removals");
+            for path in &deferred {
+                tx.remove(path)?;
+            }
+            tx.into_layer()
+        };
+        if mirror {
+            apply_layer_to_workdir(&pack, workdir, &layer)?;
+        }
+        sync_baseline_with_layer(&pack, &layer, &mut baseline)?;
+        pack.commit(layer);
+        report.deferred_removals = deferred;
+    }
+
+    // **§9.144：`harvest` 必须先于 `tail`。**
+    //
+    // `harvest` 的语义是「把 workdir 的磁盘差异收成一层」，它只在 `Output::Dir` 时有意义
+    // （Zip 路径下 workdir 是空的，收获会产出"全部删除"的错误层——实测产物 4018 → 3654）。
+    //
+    // **顺序很关键，而且我一开始放反了**：若 `harvest` 跑在 `tail` 之后，它会拿 workdir 里
+    // **旧**的 `pack.mcmeta`（那是 `materialize` 写进去的原始内容）覆盖 `tail` 刚改好的版本，
+    // 产物退回 `pack_format: 1`。实测由 `native_output_dir_matches_zip_on_a_real_pack` 抓出
+    // （Zip 路径有 `max_format: [97,1]`，Dir 路径却是 `pack_format: 1`）。
+    //
+    // 语义上也应当如此：`harvest` 收的是**任务阶段**在磁盘上留下的差异，
+    // 而 `tail` 是整条流水线的**最后一步**，其结果不该再被任何后续步骤覆盖。
+    if mirror {
+        let harvested = harvest(&pack, workdir, &baseline, None)?;
+        report.harvested_changes += harvested.changed();
+        report.added += harvested.added.len();
+        report.modified += harvested.modified.len();
+        report.removed += harvested.removed.len();
+        report.undeclared = harvested.undeclared.clone();
+        pack.commit(harvested.layer);
+    }
+    // **§9.148：诚实的相位归属。**
+    //
+    // 这一段（`tasks` 之后到 `tail` 之前）实际包含两件事：
+    //   1. **直接步骤**（`cut_gui_direct`）与延迟删除——Zip 路径上也会跑；
+    //   2. **`harvest`**——只有 `Output::Dir` 会跑。
+    //
+    // 原先只记一个 `harvest_s`，且赋值在 `if mirror` 之外，于是 **Zip 路径会报出
+    // 一个它根本没执行过的 `harvest 0.07s`**（那其实是直接步骤的时间）。相位名撒谎，
+    // 比没有相位更糟——它会让下一步优化找错目标。因此拆成两个独立相位：
+    // `direct_s` 与 `harvest_s`。
+    phases.direct_s = direct_started.elapsed().as_secs_f32();
+    phases.harvest_s = (clock.elapsed().as_secs_f32() - phases.direct_s).max(0.0);
+    clock = std::time::Instant::now();
+
+    // 收尾步骤：**§9.144 起直接在包上工作**（原先读 workdir 的 `pack.mcmeta`）。
+    {
+        let mut tx = pack.tx("tail");
+        tail(&mut tx).map_err(AromError::internal)?;
+        // **2pyr-gen：与 `pack.mcmeta` 改写同一个事务、同一时机。**
+        //
+        // 放进同一个事务而不是另开一个，是为了让"产物 = 视图"只有一次提交：
+        // 这里之后紧跟着 `write_zip` / `materialize`，任何"晚一步再塞文件"的做法
+        // 都要重写产物。写入是纯追加（不读不改包内其它条目），因此不会影响
+        // `pack.mcmeta` 之外的任何字节——`gen_metadata_lands_in_both_zip_and_dir_outputs`
+        // 用逐条摘要钉住这个性质。
+        if let Some(meta) = &opts.gen_metadata {
+            let bytes = meta.to_json_bytes().map_err(AromError::internal)?;
+            let len = bytes.len();
+            tx.put(crate::gen_metadata::FILE_NAME, bytes)
+                .map_err(|e| AromError::internal(format!("write 2pyr-gen: {e}")))?;
+            crate::log_info!(
+                "2pyr-gen: 已写入产物根 {}（{} 字节，source={} target={}）",
+                crate::gen_metadata::FILE_NAME,
+                len,
+                meta.source_pack_format,
+                meta.target_pack_format
+            );
+        }
+        let layer = tx.into_layer();
+        if !layer.writes().is_empty() {
+            sync_baseline_with_layer(&pack, &layer, &mut baseline)?;
+            pack.commit(layer);
+        }
+    }
+    phases.tail_s = clock.elapsed().as_secs_f32();
+    clock = std::time::Instant::now();
+
+    report.step_trace = trace;
+    // Android 适配点（进度）：进入产物输出段（0.90 起）。写在序列化/物化之前，
+    // 因此 `write_zip`（Output::Zip）与后续 Bedrock repack（Output::Dir）都会落到
+    // 0.90–1.00；`progress::output_progress` 只在本次开启后才上报。
+    crate::progress::output_started();
+    report.stats = match output {
+        Output::Zip(path) => {
+            let view = pack.view();
+            write_zip(&pack, &view, path, &opts.serialize)?
+        }
+        Output::Dir(dir) => {
+            // §9.117：把 A-ROM 的最终视图**直接物化回目录**——生产入口拿到的就是
+            // 「跑完整条 A-ROM 管线之后的工作目录」，随后它照旧改 `pack.mcmeta` / 跑 Bedrock /
+            // 重打包。序列化统计（`SerializeStats`）是 zip 特有的，这里留默认值；
+            // 需要"产物规模"的判据请用 §9.91/§9.115 的内容契约（它们比这组统计更强）。
+            //
+            // **必须先清空目标目录**：`materialize` 只做 `create_dir_all` + 写文件，
+            // **不会**删除目标里已有的条目。而生产传进来的目录**正是它自己解压出的源树**
+            // （§9.116），若不清空，源树中"新视图里已不存在"的文件会残留下来 ⇒ 产物分叉。
+            if dir.exists() {
+                for e in std::fs::read_dir(dir)
+                    .map_err(|e| AromError::io(format!("read {}: {e}", dir.display())))?
+                    .flatten()
+                {
+                    let p = e.path();
+                    if p.is_dir() {
+                        let _ = std::fs::remove_dir_all(&p);
+                    } else {
+                        let _ = std::fs::remove_file(&p);
+                    }
+                }
+            }
+            let view = pack.view();
+            materialize(&view, dir)?;
+            SerializeStats::default()
+        }
+    };
+    phases.output_s = clock.elapsed().as_secs_f32();
+    // `other_s` = 管线总时长 − 已计量的各相位之和。它覆盖直接步骤、延迟删除、
+    // 基线同步与报告组装等零散段。**若它长期偏大，说明相位划分漏了一段**——
+    // 这正是当初 `pipeline_s` 一个总数无法回答的问题，所以留一个显式的余量项。
+    phases.other_s = (pipeline_clock.elapsed().as_secs_f32() - phases.total()).max(0.0);
+    report.phases = phases;
+
+    // **跳过必须被说出来。** 任务是"能就做、不能就跳过"的，而跳过往往是对的
+    // （CIT 用附魔等级触发，1.21.4+ 的物品定义读不到附魔，硬翻比不转更糟）。
+    // 但此前这些理由被 `finish_dispatch` 直接丢弃，用户看到的是"转换完了、
+    // 自定义外观却没生效"，无从判断是没实现、没条件、还是自己写错了。
+    // 逐条 warn（不拼成一行：原因可能几十条，拼起来日志里读不了），再给一个总数。
+    // 注意**不要**给这些说明统一加「跳过」前缀：`notes` 里既有跳过原因，
+    // 也有普通进展（"写出 12 个物品模型定义"、"defer removal of …"）。
+    // 一律标成「跳过」会让日志说谎 —— 实测第一次就这么写错了，
+    // 于是 21 条非跳过说明被当成跳过，读日志的人会以为转换失败了一大片。
+    for note in &report.notes {
+        crate::log_warn!("{}", note);
+    }
+    if report.skipped > 0 {
+        crate::log_warn!(
+            "本次转换共跳过 {} 项（{} 条说明见上）；产物其余部分不受影响",
+            report.skipped,
+            report.notes.len()
+        );
+    }
+
+    Ok(report)
+}
+
+
+/// **`delete_shaders` 要整棵删掉的两个根**。
+///
+/// * `assets/minecraft/shaders` —— 自定义 core 着色器（`adapt_java_shaders` 处理的那棵）；
+/// * `shaders` —— 包顶层，OptiFine / Iris 光影包的落点，**适配器不碰它**。
+///
+/// 两个都写在这里而不是各写一处：清理点只认这份清单，单测也直接引用它，
+/// 避免"文档说删两棵、代码只删一棵"这类只在真实包上才暴露的分叉。
+/// 顺序即日志里的报告顺序（先 core，后顶层）。
+const SHADER_ROOTS: [&str; 2] = ["assets/minecraft/shaders", "shaders"];
+
+/// **`delete_cit` 要整棵删掉的两个根**。
+///
+/// * `assets/minecraft/optifine/cit` —— 现行 OptiFine CIT；
+/// * `assets/minecraft/mcpatcher/cit` —— MCPatcher 旧名，老包仍在用。
+///
+/// 与 `cit_item_definitions::ROOTS` **必须是同一对路径**：那边是"读哪些根"，
+/// 这里是"删哪些根"。两份常量分开写是因为两个模块的依赖方向不同
+/// （`natives` 不该反过来依赖驱动）；`cit_item_definitions` 的测试直接断言
+/// 两份相等，保证它们不会漂移。
+///
+/// 顺序即日志里的报告顺序（先 optifine，后 mcpatcher）。
+pub(crate) const CIT_ROOTS: [&str; 2] = [
+    "assets/minecraft/optifine/cit",
+    "assets/minecraft/mcpatcher/cit",
+];
+
+/// **物品定义 / CIT 三个用户开关 → 是否派发这个计划任务**。
+///
+/// 这是三个开关在**驱动侧**的唯一生效点（见 `run_native` 里那段长注释）：
+///
+/// | 任务 | 被哪个开关控制 |
+/// |---|---|
+/// | `generate_item_definitions` | `convert_item_definitions` |
+/// | `generate_cit_item_definitions` | `convert_cit && !delete_cit` |
+/// | `adapt_java_shaders` | `adapt_shaders` |
+///
+/// 其余任务一律 `true`。**默认组合（convert_item_definitions=true / convert_cit=false /
+/// delete_cit=false / adapt_shaders=true）下 `generate_cit_item_definitions` 默认不派发**
+/// （2026-10 A1 止血，理由见 [`MixedRunOptions::convert_cit`]），因此"不加新选项时产物
+/// 逐字节相同"只对没有 CIT 转换需求的包成立；默认值本身由
+/// `cit_switches_default_to_off_on_off` 钉住，能力本身由显式打开 CIT 的
+/// `modern_item_definitions_survive_the_whole_pipeline` 守住。
+///
+/// **`adapt_shaders` 是一条历史遗留的修复（2026-10）**：它在 2.1.3 引入时确实
+/// 门控着任务注册，但 M3 把任务注册表换成 `Scheduler::plan` 之后，这个字段只剩
+/// 传递、没有任何消费者——UI 上的「着色器适配」开关**看起来能关、实际关不掉**
+/// （§9.130 起的回归，之前没人发现）。本次把它接进计划过滤，恢复 UI 文案承诺的
+/// 语义。默认 true，所以默认产物不变；只有显式关过它的用户会看到差异（这正是
+/// 他们当初点那个开关想要的结果）。
+///
+/// 注意 `delete_cit` 与 `convert_cit` **同开时删除优先**：这里直接把 CIT 任务
+/// 过滤掉，而不是让它跑完再删——删除就是删除。
+fn plan_task_enabled(name: &str, opts: &MixedRunOptions) -> bool {
+    match name {
+        "generate_item_definitions" => opts.convert_item_definitions,
+        "generate_cit_item_definitions" => opts.convert_cit && !opts.delete_cit,
+        "adapt_java_shaders" => opts.adapt_shaders,
+        _ => true,
+    }
+}
+
+const EARLY_NATIVES: [&str; 10] = [
+    "generate_smithing_ui",
+    "generate_copper_armor_models",
+    "generate_netherite_armor_models",
+    "generate_poplar_planks",
+    "generate_tricky_trials_breeze",
+    "generate_shulker_box_ui",
+    "fix_slider",
+    "fix_horse_ui",
+    "fix_ui_sub_hand",
+    "fix_ui_creative",
+];
+
+/// 原生任务相对**整批旧任务**的落点：之前还是之后。///
+/// 旧批次不可拆分（§9.42），因此每个原生任务只有这两个位置可选；选哪一侧由
+/// **依赖相对次序**决定（详见 `native_placements`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Early,
+    Late,
+}
+
+/// 为每个**已派发**的原生任务决定落点（前阶段 / 后阶段）。
+///
+/// 判据（保留 §9.49 的阶段窗口，并补上显式名单）：
+///
+/// 判据（**不依赖任何"最小阶段"基准**，因此不会随迁移进度漂移）：
+///
+/// - 阶段 **== Eraser** → 前阶段。删除/改名类在生产顺序里就排最前；把它们挪到后面会让
+///   早阶段生成的新格式产物**不再被删除**（§9.76 实测：产物多 57 个文件，读数第一处偏离
+///   就是 `pre:delete_blockstates_models` 从首位消失）；
+/// - 或者列在 [`EARLY_NATIVES`] 里（**实测证据**见该常量）→ 前阶段；
+/// - 其余 → 后阶段。
+///
+/// **历史**：这条判据曾经写作「阶段**严格早于**旧批次里最小的阶段」。当时旧批次的基准是
+/// `Architect`，Eraser 级恰好满足，于是"碰巧"正确；但该基准**会随迁移进度漂移**——
+/// 真实包上派发 `generate_shulker_box_ui` 之后基准变成 `Surgeon`，`generate_boat` /
+/// `generate_potion_lingering` / `generate_tipped_arrow_images` / `generate_furnace`…
+/// 全部被挪到前阶段，立刻复现 §9.53 的 8 项 `OnlyInB`（§9.74 的逐步读数里直接可见）。
+/// 改成「整批计划的最小阶段」又让 Eraser 级**不再满足** `stage < min`（因为 `min` 就是
+/// `Eraser`），于是出现上面那条 57 个文件的偏差（§9.76）。两次实验合起来给出现在的形式。
+///
+/// 注意「同级或更晚一律提前」这类更"整齐"的判据**已被实测否决**：`generate_boat` 与
+/// `rename_blocks_items` 一旦提前，真实包立刻分叉（§9.53 记录了 8 项 OnlyInB 的产物）。
+fn native_placements(
+    plan: &[String],
+    switches: &NativeSwitches,
+) -> std::collections::HashMap<String, Side> {
+    // **Eraser 级原生任务必须最先跑**——它们是删除/改名类，生产顺序里就排在最前（阶段 1–12 之前）。
+    //
+    // 这一条**必须写成「阶段 == Eraser」而不是任何"最小阶段"比较**：§9.76 用逐步读数实测到，
+    // 一旦把 Eraser 级原生任务挪到后阶段，早阶段生成的新格式产物（`poplar_*`、铜灯泡族、
+    // `breeze_rod`…）就**不再被删除**，最终产物多出 57 个文件（`pre:` 读数的第一处偏离即
+    // `pre:delete_blockstates_models` 从首位消失）。
+    //
+    // 之前写成「阶段**严格早于**旧批次里最小的阶段」时，Eraser 级恰好满足（旧批次的基准是
+    // `Architect`），于是"碰巧"正确；而这个基准**会随迁移进度漂移**（§9.73/§9.75）。
+    // 现在把它写成**不依赖任何基准**的显式判据：Eraser → 前阶段。
+    let mut out = std::collections::HashMap::new();
+    for name in plan {
+        if native_for(name, switches).is_none() {
+            continue;
+        }
+        let is_eraser = matches!(crate::task_registry::tier_of(name), Some(Tier::Eraser));
+        let side = if is_eraser || EARLY_NATIVES.contains(&name.as_str()) {
+            Side::Early
+        } else {
+            Side::Late
+        };
+        out.insert(name.clone(), side);
+    }
+    out
+}
+
+/// 给 `natives` 的夹具正题用：按名字取**已启用全部开关**时的原生实现。
+///
+/// 夹具用例需要在不启动整条驱动的前提下直接跑单个原生任务（真实包覆盖不到那几个跳过分支）。
+#[cfg(test)]
+pub(crate) fn native_for_probe(
+    name: &str,
+) -> Option<(&'static str, TaskDecl, crate::natives::PilotFn)> {
+    // `generate_shulker_box_ui` 的实现在闭包里**但不在派发表里**（§9.51：它的正确位置在
+    // Architect 旧任务之后、Surgeon 旧任务之前，那个位置要等 Surgeon 原生化后才存在）。
+    // 夹具正题可以直接验证它的算法，因此这里额外暴露；生产路径不受影响。
+    if name == "generate_shulker_box_ui" {
+        return Some((
+            "shulker_box_gen",
+            crate::natives::shulker_box_gen::decl(),
+            crate::natives::shulker_box_gen::run,
+        ));
+    }
+    native_for(name, &NativeSwitches::all())
+}
+
+/// **逐步读数**（诊断用，§9.73 的建议）：每一步之后对 workdir 取一个廉价的指纹。
+///
+/// 目的：当真实包分叉时，能回答「**是哪一步先偏离**」，而不是只知道终点不同——
+/// §9.73 卡住的原因正是缺这份读数。
+///
+/// 指纹 = workdir 的（文件数, 总字节, 名字+大小序列的 FNV-1a）。**不读文件内容**，
+/// 所以很便宜；对「多一个文件 / 少一个文件 / 大小变了」这类分叉足够敏感。
+/// 需要定位内容差异时，再看紧随其后的**按目录**细粒度读数。
+fn digest_workdir(workdir: &Path) -> (usize, u64, u64) {
+    let mut entries: Vec<(String, u64)> = Vec::new();
+    let mut stack = vec![workdir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            match entry.file_type() {
+                Ok(t) if t.is_dir() => stack.push(p),
+                Ok(t) if t.is_file() => {
+                    let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                    let rel = p
+                        .strip_prefix(workdir)
+                        .map(|r| r.to_string_lossy().replace('\\', "/"))
+                        .unwrap_or_default();
+                    entries.push((rel, len));
+                }
+                _ => {}
+            }
+        }
+    }
+    entries.sort();
+    let files = entries.len();
+    let bytes: u64 = entries.iter().map(|(_, len)| *len).sum();
+    // FNV-1a over "path\0size\0"
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for (path, len) in &entries {
+        for b in path.as_bytes().iter().chain(b"\0").chain(len.to_le_bytes().iter()).chain(b"\0") {
+            hash ^= *b as u64;
+            hash = hash.wrapping_mul(0x1000_0000_01b3);
+        }
+    }
+    (files, bytes, hash)
+}
+
+/// 逐步读数的细粒度一档（**已就绪、暂未接线**）：对**指定前缀**下的每个文件取
+/// `名字→(大小, 内容 FNV-1a)`，用来在两份粗粒度读数之间做**逐文件**对比、
+/// 直接指出分歧出现在哪些文件上。下一轮定位 §9.73 的分叉时会用到。
+#[allow(dead_code)]
+fn digest_scope(workdir: &Path, prefix: &str) -> Vec<(String, u64, u64)> {
+    let root = workdir.join(prefix);
+    let mut out = Vec::new();
+    let mut stack = vec![root.clone()];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            match entry.file_type() {
+                Ok(t) if t.is_dir() => stack.push(p),
+                Ok(t) if t.is_file() => {
+                    let Ok(bytes) = std::fs::read(&p) else {
+                        continue;
+                    };
+                    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+                    for b in &bytes {
+                        hash ^= *b as u64;
+                        hash = hash.wrapping_mul(0x1000_0000_01b3);
+                    }
+                    let rel = p
+                        .strip_prefix(workdir)
+                        .map(|r| r.to_string_lossy().replace('\\', "/"))
+                        .unwrap_or_default();
+                    out.push((rel, bytes.len() as u64, hash));
+                }
+                _ => {}
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// 已迁移任务的派发表：**任务名 → (标签, 声明, 原生实现)**。开关关闭即返回 `None`（走旧路径）。
+///
+/// **这里是「谁已经原生化」的唯一来源**：`native_placements`、`native_names`、前/后阶段三处
+/// 都只通过 `native_for` 判断。§9.73 的教训：若另外单开一条分支返回实现（例如只给
+/// `native_for_probe` 特判），就会出现「能执行但不算原生」的分裂状态，
+/// `EARLY_NATIVES` 也随之对它失效——真实包立刻分叉。
+fn native_for(
+    name: &str,
+    switches: &NativeSwitches,
+) -> Option<(&'static str, TaskDecl, crate::natives::PilotFn)> {
+    if switches.reverse {
+        if name == "reverse_process_chest_folder" {
+            return Some((
+                "chest_reverse",
+                crate::natives::chest_reverse::decl(),
+                crate::natives::chest_reverse::run,
+            ));
+        }
+        if name == "reverse_rename_mcpatcher_to_optifine" {
+            return Some((
+                "mcpatcher_optifine_reverse",
+                crate::natives::mcpatcher_optifine_reverse::decl(),
+                crate::natives::mcpatcher_optifine_reverse::run,
+            ));
+        }
+        if name == "reverse_rename_blocks_items" {
+            return Some((
+                "rename_blocks_reverse",
+                crate::natives::rename_blocks_reverse::decl(),
+                crate::natives::rename_blocks_reverse::run,
+            ));
+        }
+        if name == "reverse_fix_armor_models" {
+            return Some((
+                "reverse_armor",
+                crate::natives::reverse_armor::decl(),
+                crate::natives::reverse_armor::run,
+            ));
+        }
+        if name == "reverse_fix_ui_survival" {
+            return Some((
+                "reverse_survival",
+                crate::natives::reverse_survival::decl(),
+                crate::natives::reverse_survival::run,
+            ));
+        }
+        if let Some((decl, run)) = crate::natives::reverse_compose::lookup(name) {
+            return Some(("reverse_compose", decl, run));
+        }
+        if let Some((decl, run)) = crate::natives::reverse_pixels::lookup(name) {
+            return Some(("reverse_pixels", decl, run));
+        }
+        if let Some((decl, run)) = crate::natives::reverse_defer_ui::lookup(name) {
+            return Some(("reverse_defer_ui", decl, run));
+        }
+        if let Some((decl, run)) = crate::natives::reverse_defer_metal::lookup(name) {
+            return Some(("reverse_defer_metal", decl, run));
+        }
+        if let Some((decl, run)) = crate::natives::reverse_defer_extra::lookup(name) {
+            return Some(("reverse_defer_extra", decl, run));
+        }
+        if let Some((decl, run)) = crate::natives::reverse_defer::lookup(name) {
+            return Some(("reverse_defer", decl, run));
+        }
+        if let Some((decl, run)) = crate::natives::reverse_trivial::lookup(name) {
+            return Some(("reverse_trivial", decl, run));
+        }
+    }
+    if switches.ui && name == "process_chest_folder" {
+        return Some((
+            "chest",
+            crate::natives::chest::decl(),
+            crate::natives::chest::run,
+        ));
+    }
+    if switches.textures {
+        if name == "generate_potion_lingering" {
+            return Some((
+                "potion_lingering_gen",
+                crate::natives::potion_lingering_gen::decl(),
+                crate::natives::potion_lingering_gen::run,
+            ));
+        }
+        if let Some((decl, run)) = crate::natives::arch_gen::lookup(name) {
+            return Some(("arch_gen", decl, run));
+        }
+        if let Some((decl, run)) = crate::natives::arch_gen2::lookup(name) {
+            return Some(("arch_gen2", decl, run));
+        }
+        if let Some((decl, run)) = crate::natives::arch_gen_metal::lookup(name) {
+            return Some(("arch_gen_metal", decl, run));
+        }
+        if let Some((decl, run)) = crate::natives::arch_gen_planks::lookup(name) {
+            return Some(("arch_gen_planks", decl, run));
+        }
+        if let Some((decl, run)) = crate::natives::arch_gen_breeze::lookup(name) {
+            return Some(("arch_gen_breeze", decl, run));
+        }
+        if let Some((decl, run)) = crate::natives::arch_gen3::lookup(name) {
+            return Some(("arch_gen3", decl, run));
+        }
+        // `generate_item_definitions`（1.21.4+ 物品模型定义）：计划里挂在 `(42,46)`。
+        // 与其它生成类任务同在 `switches.textures` 之下——它的读写对象是
+        // `assets/minecraft/models/item` 与 `assets/minecraft/items`，同属"资源"侧。
+        // 目标格式由任务自己从 `pack.mcmeta` 读（同 `adapt_java_shaders`，§9.85），
+        // 因此不需要改驱动签名。
+        if let Some((decl, run)) = crate::natives::item_definitions::lookup(name) {
+            return Some(("item_definitions", decl, run));
+        }
+        // `generate_cit_item_definitions`（OptiFine CIT → 1.21.4+ 物品定义）：
+        // 与上面一项同族（都写 `assets/minecraft/items/`），但输入是 `optifine/cit/**`，
+        // 因此是独立任务、独立阶段（Surgeon）。同样由任务自己读 `pack.mcmeta` 拿目标格式。
+        if let Some((decl, run)) = crate::natives::cit_item_definitions::lookup(name) {
+            return Some(("cit_item_definitions", decl, run));
+        }
+        // Surgeon 早期组：槽位在旧批次之前，因此与前阶段原生任务同侧（见 `EARLY_NATIVES`）。
+        if let Some((decl, run)) = crate::natives::surgeon_early::lookup(name) {
+            return Some(("surgeon_early", decl, run));
+        }
+        if let Some((decl, run)) = crate::natives::surgeon_early2::lookup(name) {
+            return Some(("surgeon_early2", decl, run));
+        }
+        if let Some((decl, run)) = crate::natives::surgeon_mid::lookup(name) {
+            return Some(("surgeon_mid", decl, run));
+        }
+        if let Some((decl, run)) = crate::natives::surgeon_mid2::lookup(name) {
+            return Some(("surgeon_mid2", decl, run));
+        }
+        if let Some((decl, run)) = crate::natives::surgeon_mid3::lookup(name) {
+            return Some(("surgeon_mid3", decl, run));
+        }
+        if let Some((decl, run)) = crate::natives::surgeon_mid4::lookup(name) {
+            return Some(("surgeon_mid4", decl, run));
+        }
+        if let Some((decl, run)) = crate::natives::surgeon_late::lookup(name) {
+            return Some(("surgeon_late", decl, run));
+        }
+        if let Some((decl, run)) = crate::natives::surgeon_ui::lookup(name) {
+            return Some(("surgeon_ui", decl, run));
+        }
+        if let Some((decl, run)) = crate::natives::surgeon_machinery::lookup(name) {
+            return Some(("surgeon_machinery", decl, run));
+        }
+        if let Some((decl, run)) = crate::natives::surgeon_survival::lookup(name) {
+            return Some(("surgeon_survival", decl, run));
+        }
+        if name == "generate_shulker_box_ui" {
+            return Some((
+                "shulker_box_gen",
+                crate::natives::shulker_box_gen::decl(),
+                crate::natives::shulker_box_gen::run,
+            ));
+        }
+    }
+    if !switches.textures {
+        return None;
+    }
+    match name {
+        // 只登记**活注册表里存在**的任务名；`convert_old_texture_paths` 与
+        // `convert_animated_textures` 不出现在任何版本映射段里（见细则 §9.12），
+        // 因此不派发。
+        "delete_font_folder" => Some((
+            "drop_font",
+            crate::natives::drop_font::decl(),
+            crate::natives::drop_font::run,
+        )),
+        "delete_blockstates_models" => Some((
+            "drop_blockstates",
+            crate::natives::drop_blockstates::decl(),
+            crate::natives::drop_blockstates::run,
+        )),
+        "delete_horse_folder" => Some((
+            "drop_horse",
+            crate::natives::drop_horse::decl(),
+            crate::natives::drop_horse::run,
+        )),
+        "delete_shaders_folder" => Some((
+            "drop_shaders",
+            crate::natives::drop_shaders::decl(),
+            crate::natives::drop_shaders::run,
+        )),
+        "delete_enchanted_item_glint" => Some((
+            "drop_glint",
+            crate::natives::drop_glint::decl(),
+            crate::natives::drop_glint::run,
+        )),
+        // `rename_blocks_items` 已派发。早年在真实包上与旧实现有差异（§9.13），根因是
+        // `ConversionMaps` 的 `HashMap::insert` 同一区间被写第二次而**静默覆盖**前一次，
+        // 2.6.0 已修复（见 `CHANGELOG`），此后真实包上运行正常。
+        "rename_blocks_items" => Some((
+            "rename_blocks",
+            crate::natives::rename_blocks::decl(),
+            crate::natives::rename_blocks::run,
+        )),
+        "rename_mcpatcher_to_optifine" => Some((
+            "mcpatcher_optifine",
+            crate::natives::mcpatcher_optifine::decl(),
+            crate::natives::mcpatcher_optifine::run,
+        )),
+        // `adapt_java_shaders`（§9.85）：**目标 pack_format 由任务自己从包里读**
+        // （`run_from_pack`），因此不需要改驱动签名——真实包里没有 `shaders/`，
+        // 生产路径上它是「源缺失 → 跳过」，与原实现一致。
+        "adapt_java_shaders" => Some((
+            "shader_adapt",
+            crate::natives::shader_adapt::decl(),
+            crate::natives::shader_adapt::run_from_pack,
+        )),
+        // `fix_smithing2_villager2_ui`（§9.87）：铁砧/村民 GUI 的第二步重排。
+        "fix_smithing2_villager2_ui" => Some((
+            "surgeon_smithing2",
+            crate::natives::surgeon_smithing2::decl(),
+            crate::natives::surgeon_smithing2::run,
+        )),
+        // `convert_animated_textures`（§9.88）：动画 mcmeta 升级。
+        // 它此前**不在任何 plan 段**里（注册了却永不执行，见 §9.88），补段后本包会真的跑到它。
+        "convert_animated_textures" => Some((
+            "animated",
+            crate::natives::animated::decl(),
+            crate::natives::animated::run,
+        )),
+        // **`cut_gui`（§9.129）**：以前它**不在本表里** —— 因为驱动只能在「整批旧任务之前/之后」
+        // 二选一，而它的槽位在批次**内部**（`(15,18)`，§9.100 实测：挪出去就少 3 个 sprite）。
+        // 于是它绕道 `Scheduler::run_named` + 注册闭包，闭包里调 `run_in_workdir`
+        // （读 gui 子树 → 内存包 → 跑 `Tx` → 写回 workdir 的一层往返桥）。
+        //
+        // 现在 46 个任务全部是原生 `Tx`，驱动改按 `plan` 顺序**逐任务**执行，因此
+        // `cut_gui` 可以直接以 `Tx` 形态跑在它的精确槽位上，那层往返桥随之取消。
+        // 派发**与 `NativeSwitches` 无关**（§9.102：它的实现无条件就是原生模块）。
+        "cut_gui" => Some((
+            "surgeon_cut_gui",
+            crate::natives::surgeon_cut_gui::decl(),
+            crate::natives::gui_surgeon_tx::run,
+        )),
+        _ => None,
+    }
+}
+
+/// 原生任务的写入是否落在它**声明**的范围内（D12 契约的落地检查）。
+///
+/// 每个任务必须精确声明读写范围；越界即契约违约，因此驱动默认直接报错
+/// （`MixedRunOptions::strict_scopes`）。范围声明同时决定并行批的分组与冲突检测——
+/// 这也是 `ScopeSet::any`（整包）会让任务退化为串行的原因。
+pub fn scope_violations(decl: &TaskDecl, layer: &Layer) -> Vec<String> {
+    layer
+        .writes()
+        .keys()
+        .filter(|path| decl.check_write(path).is_err())
+        .cloned()
+        .collect()
+}
+
+/// 把一层写入落到 workdir，使目录镜像与 pack 保持一致。
+pub(crate) fn apply_layer_to_workdir(
+    pack: &Pack,
+    workdir: &Path,
+    layer: &Layer,
+) -> Result<(), AromError> {
+    // 顺序与 `entries()` 一致：先套用本层改名规则，再套用本层写入
+    apply_renames_to_workdir(workdir, layer)?;
+
+    // **§9.137：目录缓存。**
+    //
+    // 原先每个写入条目都调一次 `create_dir_all(parent)`。实测一个任务可写 **1614** 个条目
+    // （`rename_blocks_items`，占全部 2096 次写入的 77%），其中绝大多数目录**早就存在**，
+    // 于是这变成 1600+ 次白跑的系统调用。缓存"本次调用里已确认存在的目录"后，同样的
+    // 目录只查一次。
+    let mut ensured: std::collections::HashSet<std::path::PathBuf> =
+        std::collections::HashSet::with_capacity(64);
+    let mut ensure_dir = |dir: &std::path::Path| -> Result<(), AromError> {
+        if ensured.insert(dir.to_path_buf()) {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| AromError::io(format!("mkdir {}: {e}", dir.display())))?;
+        }
+        Ok(())
+    };
+
+    for (path, slot) in layer.writes() {
+        let full = workdir.join(path);
+        match slot {
+            Slot::Tombstone => {
+                if full.is_dir() {
+                    std::fs::remove_dir_all(&full)
+                        .map_err(|e| AromError::io(format!("rmdir {}: {e}", full.display())))?;
+                } else if full.exists() {
+                    std::fs::remove_file(&full)
+                        .map_err(|e| AromError::io(format!("rm {}: {e}", full.display())))?;
+                }
+            }
+            Slot::Present(Body::Dir) => {
+                ensure_dir(&full)?;
+            }
+            Slot::Present(body) => {
+                if let Some(parent) = full.parent() {
+                    ensure_dir(parent)?;
+                }
+                let bytes = pack.read_body(body)?;
+                std::fs::write(&full, &bytes)
+                    .map_err(|e| AromError::io(format!("write {}: {e}", full.display())))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 把一层的效果落到基线上（只处理被改动的路径，不做全量重扫）。
+fn sync_baseline_with_layer(
+    pack: &Pack,
+    layer: &Layer,
+    baseline: &mut crate::arom::Materialized,
+) -> Result<(), AromError> {
+    for (path, slot) in layer.writes() {
+        match slot {
+            Slot::Tombstone => {
+                baseline.files.remove(path);
+                baseline.dirs.remove(path);
+                baseline.files.retain(|p, _| !is_under(p, path));
+                baseline.dirs.retain(|p| !is_under(p, path));
+            }
+            Slot::Present(Body::Dir) => {
+                baseline.dirs.insert(path.clone());
+            }
+            Slot::Present(body) => {
+                let bytes = pack.read_body(body)?;
+                baseline
+                    .files
+                    .insert(path.clone(), (bytes.len() as u64, sha256_hex(&bytes)));
+                let mut cursor = parent_of(path);
+                while let Some(p) = cursor {
+                    baseline.dirs.insert(p.to_string());
+                    cursor = parent_of(p);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_under(path: &str, prefix: &str) -> bool {
+    path.len() > prefix.len() && path.starts_with(prefix) && path.as_bytes()[prefix.len()] == b'/'
+}
+
+/// 契约检查：原生层**写出的文件**必须已经在 `workdir` 里就位。
+///
+/// 为什么值得一次 stat：驱动让 A-ROM 层与旧实现**共用同一个 workdir**，而
+/// **直接步骤**（GuiSurgeon / cut_gui）与旧批次一样是直接读盘的。若某处漏了
+/// `apply_layer_to_workdir`，它们会读到**上一阶段**的内容，产物静默分叉——
+/// `generate_smithing_ui` 的 4 个 sprite 就是这样丢的（§9.52）。
+/// 这里比对磁盘文件大小与层里 blob 的大小：漏写会命中「文件不存在」，
+/// 写了旧内容多半命中「大小不符」，两者都直接**自报任务名与路径**。
+fn check_layer_materialized(
+    pack: &Pack,
+    workdir: &Path,
+    layer: &Layer,
+    name: &str,
+) -> Result<(), AromError> {
+    for (path, slot) in layer.writes() {
+        let Slot::Present(Body::Blob(id)) = slot else {
+            continue;
+        };
+        let want = pack.blobs().get(*id)?.len() as u64;
+        let full = workdir.join(path);
+        match std::fs::metadata(&full) {
+            Ok(meta) if meta.len() == want => {}
+            Ok(meta) => {
+                return Err(AromError::internal(format!(
+                    "native task `{name}`: workdir copy of `{path}` is stale \
+                     ({} bytes on disk, {want} bytes in the layer)",
+                    meta.len()
+                )));
+            }
+            Err(e) => {
+                return Err(AromError::internal(format!(
+                    "native task `{name}`: `{path}` is missing from the workdir after \
+                     apply_layer_to_workdir ({e})"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parent_of(path: &str) -> Option<&str> {
+    path.rfind('/').map(|i| &path[..i])
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+
+/// 把一层的**改名规则**落到 workdir（Move = 磁盘移动，Copy = 复制）。
+///
+/// 逐条规则处理：`from` 是文件时按单条移动（旧实现里文件级改名很常见，早先这里漏了分支、
+/// 直接 `read_dir` 会 panic）；是目录时先深后浅移动，最后清掉空的源目录。
+///
+/// **§9.141：`Move` 且目标不存在时，整目录一次 `fs::rename`。**
+///
+/// 原实现把目录改名展开成**逐条目移动**：先 `collect_paths` 遍历整棵树、按深度排序，
+/// 再对每个文件调一次 `move_or_copy`（其中还各带一次 `create_dir_all`）。
+/// 真实包实测：`rename_mcpatcher_to_optifine`（mcpatcher → optifine，约 1600 个文件）
+/// **2.16s**——这是全流水线最贵的单步，而它在语义上只是**一次同卷目录改名**。
+///
+/// `Move` + 目标不存在 ⇒ 两者等价（含子目录结构），因此走快路径；
+/// 目标已存在时仍需逐条合并，故保留原路径。
+fn apply_renames_to_workdir(workdir: &Path, layer: &Layer) -> Result<(), AromError> {
+    use crate::arom::RenameMode;
+
+    // 与 `apply_layer_to_workdir` 同样的目录缓存：逐条目路径下避免重复 `create_dir_all`。
+    let mut ensured: std::collections::HashSet<std::path::PathBuf> =
+        std::collections::HashSet::with_capacity(32);
+    let mut ensure_dir = |dir: &std::path::Path| -> Result<(), AromError> {
+        if ensured.insert(dir.to_path_buf()) {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| AromError::io(format!("mkdir {}: {e}", dir.display())))?;
+        }
+        Ok(())
+    };
+
+    for rule in layer.renames() {
+        let from = workdir.join(&rule.from);
+        if !from.exists() {
+            continue;
+        }
+        let to = workdir.join(&rule.to);
+        if from.is_file() {
+            move_or_copy(&from, &to, rule.mode, &mut ensure_dir)?;
+            continue;
+        }
+
+        // 快路径：同卷整目录改名（目标不存在时与逐条目移动等价）。
+        if rule.mode == RenameMode::Move && !to.exists() {
+            if let Some(parent) = to.parent() {
+                ensure_dir(parent)?;
+            }
+            std::fs::rename(&from, &to).map_err(|e| {
+                AromError::io(format!("rename dir {}: {e}", from.display()))
+            })?;
+            continue;
+        }
+
+        let mut items: Vec<std::path::PathBuf> = Vec::new();
+        collect_paths(&from, &mut items)?;
+        items.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+        for path in items {
+            let rest = path
+                .strip_prefix(&from)
+                .map_err(|e| AromError::io(format!("strip {}: {e}", path.display())))?;
+            move_or_copy(&path, &to.join(rest), rule.mode, &mut ensure_dir)?;
+        }
+        if rule.mode == RenameMode::Move && from.exists() {
+            std::fs::remove_dir_all(&from)
+                .map_err(|e| AromError::io(format!("rmdir {}: {e}", from.display())))?;
+        }
+    }
+    Ok(())
+}
+
+fn move_or_copy(
+    from: &Path,
+    to: &Path,
+    mode: crate::arom::RenameMode,
+    ensure_dir: &mut dyn FnMut(&std::path::Path) -> Result<(), AromError>,
+) -> Result<(), AromError> {
+    if let Some(parent) = to.parent() {
+        ensure_dir(parent)?;
+    }
+    if mode == crate::arom::RenameMode::Move {
+        if to.exists() {
+            remove_path(to)?;
+        }
+        std::fs::rename(from, to)
+            .map_err(|e| AromError::io(format!("rename {}: {e}", from.display())))?;
+    } else {
+        std::fs::copy(from, to)
+            .map_err(|e| AromError::io(format!("copy {}: {e}", from.display())))?;
+    }
+    Ok(())
+}
+
+fn collect_paths(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> Result<(), AromError> {
+    let entries =
+        std::fs::read_dir(dir).map_err(|e| AromError::io(format!("read {}: {e}", dir.display())))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| AromError::io(format!("dir entry: {e}")))?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_paths(&path, out)?;
+        }
+        out.push(path);
+    }
+    Ok(())
+}
+
+fn remove_path(path: &Path) -> Result<(), AromError> {
+    if path.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    }
+    .map_err(|e| AromError::io(format!("rm {}: {e}", path.display())))
+}
+
+/// 工作目录必须是空目录：残留文件会被 `harvest` 误判成「任务新增」。
+fn ensure_empty_dir(dir: &Path) -> Result<(), AromError> {
+    if dir.exists() {
+        let mut entries = std::fs::read_dir(dir)
+            .map_err(|e| AromError::io(format!("read {}: {e}", dir.display())))?;
+        if entries.next().is_some() {
+            return Err(AromError::io(format!(
+                "work dir must be empty: {}",
+                dir.display()
+            )));
+        }
+    } else {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| AromError::io(format!("create {}: {e}", dir.display())))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pack::diff::diff_containers;
+    use std::io::Write as _;
+    use std::path::PathBuf;
+
+    fn png(size: (u32, u32)) -> Vec<u8> {
+        let img = image::RgbaImage::from_pixel(size.0, size.1, image::Rgba([120, 60, 30, 255]));
+        let mut buf = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .expect("encode png");
+        buf
+    }
+
+    /// 夹具刻意带上几个会被真实任务处理的结构（mcpatcher 目录、font 目录、
+    /// item 下的动画 mcmeta、旧贴图路径）。
+    fn fixture(path: &Path) {
+        fixture_ex(path, false)
+    }
+
+    /// 夹具本体；`with_shaders` 为真时额外写入**两棵** shaders 树，专供
+    /// `delete_shaders` 的用例使用。
+    ///
+    /// 为什么带上**显式目录条目**（`assets/minecraft/shaders/` 与 `.../core/`）：
+    /// 真实包（实测 `濯卿觎1.20.1布吉岛材质 (1).zip`）里这两级目录是独立的 zip 条目，
+    /// 不是"只由文件隐含"。`tx.remove(前缀)` 的 tombstone 对精确路径与子路径都生效，
+    /// 但**这条性质必须有测试守**——只测隐含目录的话，将来"优化"成按文件枚举删除
+    /// 就会把目录条目留在产物里，而游戏恰好也可能因为空目录继续报错。
+    ///
+    /// 为什么顶层 `shaders/` 也要有：`adapt_java_shaders` 只认
+    /// `assets/minecraft/shaders`（它的 `SHADERS` 常量），**完全不会碰** OptiFine /
+    /// Iris 的顶层光影包。只删 core 那一棵树，等于对"光影导致加载失败"的场景无效。
+    fn fixture_ex(path: &Path, with_shaders: bool) {
+        let f = std::fs::File::create(path).expect("create fixture");
+        let mut zip = zip::ZipWriter::new(f);
+        let opts = zip::write::FileOptions::default();
+        // 目录条目必须先于 `add` 闭包写：闭包会独占 `&mut zip`。
+        if with_shaders {
+            zip.add_directory("assets/minecraft/shaders/", opts).expect("dir");
+            zip.add_directory("assets/minecraft/shaders/core/", opts).expect("dir");
+            zip.add_directory("shaders/", opts).expect("dir");
+            zip.add_directory("shaders/post/", opts).expect("dir");
+        }
+        let mut add = |name: &str, body: Vec<u8>| {
+            zip.start_file(name, opts).expect("start");
+            zip.write_all(&body).expect("write");
+        };
+
+        if with_shaders {
+            add(
+                "assets/minecraft/shaders/core/rendertype_lines.vsh",
+                b"#version 150\n// lines\n".to_vec(),
+            );
+            add(
+                "assets/minecraft/shaders/core/rendertype_lines.fsh",
+                b"#version 150\n// lines\n".to_vec(),
+            );
+            add(
+                "assets/minecraft/shaders/core/rendertype_lines.json",
+                br#"{"blend":{}}"#.to_vec(),
+            );
+            add(
+                "assets/minecraft/shaders/core/position_color.vsh",
+                b"#version 150\n// pos\n".to_vec(),
+            );
+            add(
+                "shaders/post/color_convolve.json",
+                br#"{"targets":{}}"#.to_vec(),
+            );
+            add("shaders/lib/util.glsl", b"// util\n".to_vec());
+        }
+        add(
+            "pack.mcmeta",
+            br#"{"pack":{"pack_format":34,"description":"fixture"}}"#.to_vec(),
+        );
+        add("assets/minecraft/mcpatcher/cit/a.properties", b"a=1".to_vec());
+        add("assets/minecraft/font/default.json", b"{}".to_vec());
+        add("assets/minecraft/terrain.png", png((16, 16)));
+        add("assets/minecraft/gui/items.png", png((16, 32)));
+        add("assets/minecraft/textures/item/water.png", png((32, 64)));
+        add(
+            "assets/minecraft/textures/item/water.png.mcmeta",
+            br#"{"animation": {}}"#.to_vec(),
+        );
+        add("assets/minecraft/lang/zh_cn.json", br#"{"a":"b"}"#.to_vec());
+        zip.add_directory("assets/empty/", opts).expect("dir");
+        zip.finish().expect("finish");
+    }
+
+
+
+    /// **物品定义 / CIT 开关**专用夹具：两棵 CIT 源目录 + 一个能触发
+    /// `generate_item_definitions` 的物品模型。
+    ///
+    /// 为什么不用通用夹具：通用夹具里只有一条 `mcpatcher/cit/a.properties`，
+    /// 内容不是合法 CIT（`a=1`），CIT 任务会把它当"不是规则"跳过——那测不出
+    /// "关闭时源文件保留"与"删除时目录消失"的差别。
+    ///
+    /// 刻意写入**显式目录条目**（`optifine/cit/`、`optifine/cit/test/`、
+    /// `mcpatcher/cit/`）：真实包（实测 `濯卿觎1.20.1布吉岛材质 (1).zip`）里
+    /// 这三层都是独立 zip 条目，删除必须连目录条目一起带走。
+    ///
+    /// 两条 CIT 规则分别来自两个根，且都用数字 `CustomModelData`：
+    /// * `optifine/cit/test/cmd.properties` → `items/stick.json` 的 7 档；
+    /// * `mcpatcher/cit/old.properties` → 同一物品的 9 档。
+    /// 两条并进同一张 `range_dispatch` 表，正好覆盖"两个根都读到"。
+    fn fixture_cit(path: &Path) {
+        let f = std::fs::File::create(path).expect("create cit fixture");
+        let mut zip = zip::ZipWriter::new(f);
+        let opts = zip::write::FileOptions::default();
+        zip.add_directory("assets/minecraft/optifine/cit/", opts).expect("dir");
+        zip.add_directory("assets/minecraft/optifine/cit/test/", opts).expect("dir");
+        zip.add_directory("assets/minecraft/mcpatcher/cit/", opts).expect("dir");
+        let mut add = |name: &str, body: Vec<u8>| {
+            zip.start_file(name, opts).expect("start");
+            zip.write_all(&body).expect("write");
+        };
+        add(
+            "pack.mcmeta",
+            br#"{"pack":{"pack_format":34,"description":"cit fixture"}}"#.to_vec(),
+        );
+        add(
+            "assets/minecraft/optifine/cit/test/cmd.properties",
+            b"type=item\nitems=stick\ntexture=x.png\nnbt.CustomModelData=7\n".to_vec(),
+        );
+        add("assets/minecraft/optifine/cit/test/x.png", png((16, 16)));
+        add(
+            "assets/minecraft/mcpatcher/cit/old.properties",
+            b"type=item\nitems=stick\nmodel=minecraft:item/stick\nnbt.CustomModelData=9\n"
+                .to_vec(),
+        );
+        // 让 `generate_item_definitions` 有活干：bow 在官方参考表里，会写出
+        // `items/bow.json`；`stick` 是平凡定义，刻意不写（留给 CIT 写）。
+        add(
+            "assets/minecraft/models/item/bow.json",
+            br#"{"parent":"item/generated","textures":{"layer0":"item/bow"},
+                 "overrides":[{"predicate":{"custom_model_data":5},"model":"item/bow_pulling_0"}]}"#
+                .to_vec(),
+        );
+        zip.finish().expect("finish");
+    }
+
+    /// 该路径是否落在 [`CIT_ROOTS`] 之下（入口与子路径都算，容忍目录尾斜杠）。
+    fn is_cit_path(name: &str) -> bool {
+        let p = name.trim_end_matches('/');
+        CIT_ROOTS
+            .iter()
+            .any(|r| p == *r || p.starts_with(&format!("{r}/")))
+    }
+
+    /// 物品定义 / CIT 开关的变体：目标 55 正好跨 `(42,46)` 与 `(46,55)` 两条边，
+    /// 两个任务都会出现在计划里。
+    fn native_output_cit_switches(
+        input: &Path,
+        tmp: &Path,
+        convert_item_definitions: bool,
+        convert_cit: bool,
+        delete_cit: bool,
+        tag: &str,
+    ) -> (PathBuf, MixedRunReport) {
+        let work = tmp.join(format!("cit_work_{tag}"));
+        let out = tmp.join(format!("cit_{tag}.zip"));
+        let opts = MixedRunOptions {
+            source_version: 34,
+            target_version: 55,
+            convert_item_definitions,
+            convert_cit,
+            delete_cit,
+            native: NativeSwitches::all(),
+            ..MixedRunOptions::default()
+        };
+        let report = run_native(input, &work, &Output::Zip(out.clone()), &opts, |tx| {
+            if tx.exists("pack.mcmeta") {
+                let cur = tx.text("pack.mcmeta").map_err(|e| e.to_string())?;
+                let next = crate::pack::version_converter::rewrite_pack_mcmeta_text(&cur, 55)?;
+                tx.put("pack.mcmeta", next.into_bytes())
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        })
+        .expect("run_native with cit switches");
+        (out, report)
+    }
+
+    fn assert_equivalent(legacy: &Path, mixed: &Path) -> crate::pack::diff::PackDiffReport {
+        let report = diff_containers(legacy, mixed).expect("diff");
+        // 让失败自报身份：路径即配置标签（legacy.zip / v2_on.zip / v2_one_by_one.zip …）
+        println!("compare a={} b={}", report.a, report.b);
+        assert_eq!(report.blocking, 0, "内容差异：{:?}", report.diffs);
+        assert_eq!(
+            report.container_entry_set_blocking, 0,
+            "条目集合差异：{:?}",
+            report.container
+        );
+        assert_eq!(
+            report.container_byte_only, 0,
+            "容器字节属性差异：{:?}",
+            report.container
+        );
+        assert!(report.passed(true), "{:?}", report.container);
+        report
+    }
+
+
+    /// **放置规则的回归测试**：这条规则是本项目最贵的教训沉淀（§9.42/§9.48/§9.50/§9.52），
+    /// 却一直没有单测护着——只有真实包闸门兜底（跑一次 40 秒）。这里用**真实计划**把它钉住。
+    ///
+    /// 断言三件事：
+    /// 1. `EARLY_NATIVES` 里的任务确实被判为 `Early`（**名单不是装饰**）；
+    /// 2. **Eraser 级的每个已派发原生任务都判为 `Early`**——这是 §9.76 定稿的判据，
+    ///    且实测是**载荷**的：删到后阶段会让早阶段生成的产物不再被删除（多 57 个文件）；
+    /// 3. 曾被误判的**必须留在 `Late`**：`fix_clock_compass`（§9.59 的 100 项差异）
+    ///    与 `generate_boat`（§9.53 的 8 项 OnlyInB）——将来谁"顺手提前"会当场红。
+    ///
+    /// **历史（§9.73/§9.75/§9.76）**：判据曾经是「阶段严格早于旧批次最小阶段」，而那个基准
+    /// 会随迁移进度漂移；改用「整批计划最小阶段」又让 Eraser 级不再满足 `stage < min`。
+    /// 两次实验合起来给出现在的显式形式：**Eraser → 前阶段，名单 → 前阶段，其余 → 后阶段**。
+    #[test]
+    fn native_placement_rule_is_pinned_by_the_real_plan() {
+        use crate::arom::engine::scheduler::Scheduler;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let input = tmp.path().join("fixture.zip");
+        fixture(&input);
+
+        let mut scheduler = Scheduler::new();
+        // §9.125：**不需要旧闭包**——本用例只用 `plan()`（来自 `ConversionMaps`）与
+        // `task_tier()`（元数据表）。因此默认构建下它照样守得住「Eraser → 前阶段」这条
+        // 最贵的教训（这正是「元数据与闭包拆开」的直接收益）。
+        crate::invoke_conversion::register_tasks(
+            &mut scheduler, &input, 97, 1, true, false, true,
+        );
+        let plan = scheduler.plan(1, 97).expect("plan");
+
+        // 只在本夹具能覆盖到这些任务时才断言（夹具的任务集合可能随版本映射变化）
+        let placements = native_placements(&plan, &NativeSwitches::all());
+        if placements.is_empty() {
+            println!("夹具计划里没有已派发的原生任务，跳过");
+            return;
+        }
+
+        for name in EARLY_NATIVES {
+            if let Some(side) = placements.get(name) {
+                assert_eq!(
+                    *side,
+                    Side::Early,
+                    "`{name}` 在 EARLY_NATIVES 里，必须判为 Early"
+                );
+            }
+        }
+        for name in ["fix_clock_compass", "generate_boat"] {
+            if let Some(side) = placements.get(name) {
+                assert_eq!(
+                    *side,
+                    Side::Late,
+                    "`{name}` 必须判为 Late（提前会让真实包分叉，见 §9.53/§9.59）"
+                );
+            }
+        }
+        // **阶段判据的真实边界**（§9.76 定稿）：判据**不再依赖任何"最小阶段"基准**，
+        // 而是直接的「阶段 == Eraser → 前阶段」。所以这里断言：凡是 Eraser 级的已派发原生任务
+        // 都必须判为 Early——§9.76 的实测表明这条是**载荷**的：把它们挪到后阶段，
+        // 早阶段生成的新格式产物就不再被删除，真实包产出会多 57 个文件。
+        let mut saw_eraser = false;
+        for name in &plan {
+            if native_for(name, &NativeSwitches::all()).is_none() {
+                continue;
+            }
+            // §9.131：与生产路径同源——驱动现在直接读 `task_registry`，不再经 `Scheduler`。
+            let is_eraser = matches!(crate::task_registry::tier_of(name), Some(Tier::Eraser));
+            if is_eraser {
+                saw_eraser = true;
+                assert_eq!(
+                    placements.get(name),
+                    Some(&Side::Early),
+                    "`{name}` 是 Eraser 级，必须判为 Early（§9.76：删除类必须最先跑）"
+                );
+            }
+        }
+        assert!(saw_eraser, "计划里应当至少有一个 Eraser 级原生任务");
+    }
+
+    /// **逐步读数**（默认忽略，§9.73 的诊断工具）：
+    /// `AROM_REAL_PACK=<包> cargo test --lib trace_stepwise -- --ignored --nocapture`
+    ///
+    /// 它做两件事：
+    /// 1. **验证读数本身不改变产物**——打开 `step_trace` 会把旧批次改成「逐任务执行 + 逐任务收层」
+    ///    （为了拿到 `legacy:<任务名>` 粒度的读数），所以先断言它与生产口径（一次性批量）**产物一致**；
+    /// 2. 打印每一步的 `(文件数, 总字节, 名字指纹)`，用来回答「分叉是**哪一步**先发生的」。
+    ///
+    /// 对比两份读数时：前缀相同、从某一标签起指纹不同 ⇒ 该标签即**第一处偏离**。
+    #[test]
+    #[ignore]
+    fn trace_stepwise_on_a_real_pack() {
+        let Ok(src) = std::env::var("AROM_REAL_PACK") else {
+            println!("AROM_REAL_PACK 未设置，跳过");
+            return;
+        };
+        let input = PathBuf::from(&src);
+        let source = {
+            let pack = Pack::open_zip(&input, &SafeLimits::preserving_current(), None)
+                .expect("open for source format");
+            pack.view()
+                .mcmeta()
+                .ok()
+                .and_then(|m| m.effective_format())
+                .unwrap_or(34)
+        };
+        let target: u32 = std::env::var("AROM_TARGET")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(97);
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        // 生产口径
+        let (prod, _) = native_output_v2(
+            &input,
+            tmp.path(),
+            target,
+            source,
+            NativeSwitches::all(),
+            false,
+            "prod",
+        );
+        // 读数口径（step_trace=true → 旧批次逐任务收层）
+        let work = tmp.path().join("v2_work_trace");
+        let out = tmp.path().join("v2_trace.zip");
+        let opts = MixedRunOptions {
+            source_version: source,
+            target_version: target,
+            native: NativeSwitches::all(),
+            step_trace: true,
+            ..MixedRunOptions::default()
+        };
+        let report = run_native(&input, &work, &Output::Zip(out.clone()), &opts, |tx| {
+            if tx.exists("pack.mcmeta") {
+                let cur = tx.text("pack.mcmeta").map_err(|e| e.to_string())?;
+                let next = crate::pack::version_converter::rewrite_pack_mcmeta_text(&cur, target)?;
+                tx.put("pack.mcmeta", next.into_bytes())
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        })
+        .expect("traced run");
+
+        println!("=== 逐步读数（label\tfiles\tbytes\thash）===");
+        for (label, files, bytes, hash) in &report.step_trace {
+            println!("{label}\t{files}\t{bytes}\t{hash:016x}");
+        }
+        println!("=== 读数结束（共 {} 步）===", report.step_trace.len());
+
+        // 读数不得改变产物
+        assert_equivalent(&prod, &out);
+    }
+
+
+
+
+
+
+
+    /// 声明范围检查必须真的能抓住越界写入（否则它就是空转的）。
+    #[test]
+    fn scope_violations_flags_out_of_scope_writes() {
+        use crate::arom::task::{ScopeSet, Tier};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let input = tmp.path().join("fixture.zip");
+        fixture(&input);
+        let mut pack =
+            Pack::open_zip(&input, &SafeLimits::preserving_current(), None).expect("open");
+
+        let layer = {
+            let mut tx = pack.tx("probe");
+            tx.put("assets/minecraft/textures/bar/x.png", b"x".to_vec())
+                .expect("put");
+            tx.into_layer()
+        };
+
+        let narrow = TaskDecl::new("narrow", Tier::Eraser)
+            .writes(ScopeSet::prefix("assets/minecraft/textures/foo"));
+        assert_eq!(
+            scope_violations(&narrow, &layer),
+            vec!["assets/minecraft/textures/bar/x.png".to_string()],
+            "越界写入必须被报出"
+        );
+
+        let wide = TaskDecl::new("wide", Tier::Eraser)
+            .writes(ScopeSet::prefix("assets/minecraft/textures/bar"));
+        assert!(
+            scope_violations(&wide, &layer).is_empty(),
+            "范围内的写入不报"
+        );
+    }
+
+    #[test]
+    /// 层里的**改名规则**必须镜像到 workdir：目录级与文件级各一条
+    /// （后者早先会因对文件调用 `read_dir` 而 panic）。
+    #[test]
+    fn layer_renames_are_mirrored_into_the_work_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let input = tmp.path().join("fixture.zip");
+        fixture(&input);
+        let mut pack =
+            Pack::open_zip(&input, &SafeLimits::preserving_current(), None).expect("open");
+        let work = tmp.path().join("work");
+        materialize(&pack.view(), &work).expect("materialize");
+
+        let layer = {
+            let mut tx = pack.tx("mirror-probe");
+            tx.rename_dir(
+                "assets/minecraft/textures/item",
+                "assets/minecraft/textures/moved",
+            )
+            .expect("dir rename");
+            tx.rename_dir(
+                "assets/minecraft/lang/zh_cn.json",
+                "assets/minecraft/lang/zh.json",
+            )
+            .expect("file rename");
+            tx.put("assets/minecraft/new.txt", b"x".to_vec())
+                .expect("put");
+            tx.into_layer()
+        };
+        apply_layer_to_workdir(&pack, &work, &layer).expect("mirror");
+
+        assert!(
+            work.join("assets/minecraft/textures/moved/water.png").exists(),
+            "目录规则要落到磁盘"
+        );
+        assert!(
+            !work.join("assets/minecraft/textures/item").exists(),
+            "源目录应消失"
+        );
+        assert!(
+            work.join("assets/minecraft/lang/zh.json").exists(),
+            "文件级规则要落到磁盘"
+        );
+        assert!(
+            !work.join("assets/minecraft/lang/zh_cn.json").exists(),
+            "文件级规则的源应消失"
+        );
+        assert!(work.join("assets/minecraft/new.txt").exists(), "写入照旧");
+    }
+
+
+    /// 与 [`native_output_v2_opts`] 同口径，但只暴露历史那组参数（其余取结构体默认）。
+    fn native_output_v2(
+        input: &Path,
+        tmp: &Path,
+        target: u32,
+        source: u32,
+        native: NativeSwitches,
+        legacy_one_by_one: bool,
+        tag: &str,
+    ) -> (PathBuf, MixedRunReport) {
+        native_output_v2_opts(
+            input,
+            tmp,
+            MixedRunOptions {
+                source_version: source,
+                target_version: target,
+                native,
+                legacy_one_by_one,
+                ..MixedRunOptions::default()
+            },
+            tag,
+        )
+    }
+
+    /// **完整选项版**的 `run_native` 夹具。
+    ///
+    /// 用于"某项默认值已改、但仍要测它开启时行为"的用例：调用方显式给出那个开关，
+    /// 其余保持 [`MixedRunOptions::default`]。`tail` 与生产入口一致（只改 mcmeta 的目标格式）。
+    fn native_output_v2_opts(
+        input: &Path,
+        tmp: &Path,
+        opts: MixedRunOptions,
+        tag: &str,
+    ) -> (PathBuf, MixedRunReport) {
+        let work = tmp.join(format!("v2_work_{tag}"));
+        let out = tmp.join(format!("v2_{tag}.zip"));
+        let target = opts.target_version;
+        let report = run_native(input, &work, &Output::Zip(out.clone()), &opts, move |tx| {
+            if tx.exists("pack.mcmeta") {
+                let cur = tx.text("pack.mcmeta").map_err(|e| e.to_string())?;
+                let next = crate::pack::version_converter::rewrite_pack_mcmeta_text(&cur, target)?;
+                tx.put("pack.mcmeta", next.into_bytes())
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        })
+        .expect("mixed run v2");
+        (out, report)
+    }
+
+    /// zip 的**全部**条目名（含目录条目，保留尾斜杠）——目录条目是 shaders 删除的
+    /// 关键对象之一，`zip_entry_digests` 会跳过它们，所以这里单独读一遍。
+    fn zip_entry_names(zip_path: &Path) -> Vec<String> {
+        let f = std::fs::File::open(zip_path).expect("open zip");
+        let mut ar = zip::ZipArchive::new(f).expect("zip");
+        let mut out = Vec::new();
+        for i in 0..ar.len() {
+            let Ok(e) = ar.by_index(i) else { continue };
+            out.push(e.name().to_string());
+        }
+        out.sort();
+        out
+    }
+
+    /// 该路径是否落在 `SHADER_ROOTS` 之下（入口与子路径都算，容忍目录的尾斜杠）。
+    fn is_shader_path(name: &str) -> bool {
+        let p = name.trim_end_matches('/');
+        SHADER_ROOTS.iter().any(|r| p == *r || p.starts_with(&format!("{r}/")))
+    }
+
+    /// `delete_shaders` 的变体：其余选项与生产同口径（全原生 + GUI 手术开）。
+    fn native_output_delete_shaders(
+        input: &Path,
+        tmp: &Path,
+        delete_shaders: bool,
+        tag: &str,
+    ) -> (PathBuf, MixedRunReport) {
+        let work = tmp.join(format!("del_work_{tag}"));
+        let out = tmp.join(format!("del_{tag}.zip"));
+        let opts = MixedRunOptions {
+            source_version: 34,
+            target_version: 55,
+            delete_shaders,
+            native: NativeSwitches::all(),
+            ..MixedRunOptions::default()
+        };
+        let report = run_native(input, &work, &Output::Zip(out.clone()), &opts, |tx| {
+            if tx.exists("pack.mcmeta") {
+                let cur = tx.text("pack.mcmeta").map_err(|e| e.to_string())?;
+                let next = crate::pack::version_converter::rewrite_pack_mcmeta_text(&cur, 55)?;
+                tx.put("pack.mcmeta", next.into_bytes())
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        })
+        .expect("run_native with delete_shaders");
+        (out, report)
+    }
+
+    /// **`delete_shaders`：开启时两棵 shaders 树消失，其余条目逐条不变。**
+    ///
+    /// 钉住四件事（每一条都对应一个真实的失败形态）：
+    ///
+    /// 1. **默认必须是关的**。这是"不加这个选项时产物逐字节相同"的第一道闸门——
+    ///    真正的逐字节对照由已有的夹具/真实包闸门守（它们跑的就是默认配置），
+    ///    这里只保证默认值不会被人"顺手改成 true"。
+    /// 2. **关**：两棵树都还在（core 与顶层各至少一条），`deleted_shaders == 0`，
+    ///    且清理点里**没有**这两个根（说明没有偷偷登记删除）。
+    /// 3. **开**：一条不剩——包括**显式目录条目**；`deleted_shaders` 必须等于关闭时
+    ///    那两棵树的条目数（含目录），否则说明"数出来的"和"删掉的"不是同一批东西。
+    /// 4. **删除走延迟删除的清理点**：`report.deferred_removals` 里能看到两个根。
+    ///    这条是"时机正确"的可观测证据：早删（任务阶段内）不会出现在这个清单里。
+    ///
+    /// 另外断言"非 shaders 条目逐条相同"：这个开关只该删 shaders，不该顺手改动
+    /// 其它任何字节（例如提前删导致后续任务看不见文件、进而改变产物）。
+    ///
+    /// 源 34 → 目标 55 是刻意的：这条路径上 `adapt_java_shaders` 会跑三次
+    /// （34→42→46→55）。若删除被提前到任务阶段，那三次会看到空目录而静默跳过，
+    /// 用例的 3/4 两点就会红。
+    #[test]
+    fn delete_shaders_removes_both_roots_and_nothing_else() {
+        assert!(
+            !MixedRunOptions::default().delete_shaders,
+            "默认必须关闭：否则所有用户的产物都会少掉 shaders"
+        );
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let input = tmp.path().join("fixture_shaders.zip");
+        fixture_ex(&input, true);
+
+        let (off_zip, off_report) = native_output_delete_shaders(&input, tmp.path(), false, "off");
+        let (on_zip, on_report) = native_output_delete_shaders(&input, tmp.path(), true, "on");
+
+        // ── 关闭：两棵树都在，且什么都没登记删除 ──────────────────────────
+        let off_entries = zip_entry_names(&off_zip);
+        let off_shader_entries: Vec<&String> =
+            off_entries.iter().filter(|n| is_shader_path(n)).collect();
+        assert!(
+            off_shader_entries
+                .iter()
+                .any(|n| n.starts_with("assets/minecraft/shaders/core/")),
+            "关闭时 core 着色器必须原样保留，实际条目：{off_entries:?}"
+        );
+        assert!(
+            off_shader_entries.iter().any(|n| n.starts_with("shaders/post/")),
+            "关闭时顶层 shaders 必须原样保留，实际条目：{off_entries:?}"
+        );
+        assert_eq!(off_report.deleted_shaders, 0);
+        assert!(
+            !off_report
+                .deferred_removals
+                .iter()
+                .any(|p| SHADER_ROOTS.contains(&p.as_str())),
+            "关闭时不应登记任何 shaders 删除：{:?}",
+            off_report.deferred_removals
+        );
+
+        // ── 开启：一条不剩（含显式目录条目）─────────────────────────────
+        let on_entries = zip_entry_names(&on_zip);
+        let leftovers: Vec<&String> = on_entries.iter().filter(|n| is_shader_path(n)).collect();
+        assert!(
+            leftovers.is_empty(),
+            "开启后 shaders 必须一条不剩（含目录条目），残留：{leftovers:?}"
+        );
+        assert_eq!(
+            on_report.deleted_shaders,
+            off_shader_entries.len(),
+            "删掉的条目数必须等于关闭时两棵树里的条目数（含目录）"
+        );
+        for root in SHADER_ROOTS {
+            assert!(
+                on_report.deferred_removals.iter().any(|p| p == root),
+                "`{root}` 必须登记在延迟删除清单里（清理点时机），实际：{:?}",
+                on_report.deferred_removals
+            );
+        }
+
+        // ── 其余条目逐条相同（开关只该删 shaders）───────────────────────
+        let off_rest: Vec<_> = zip_entry_digests(&off_zip)
+            .into_iter()
+            .filter(|(n, _, _)| !is_shader_path(n))
+            .collect();
+        let on_rest: Vec<_> = zip_entry_digests(&on_zip)
+            .into_iter()
+            .filter(|(n, _, _)| !is_shader_path(n))
+            .collect();
+        assert_eq!(
+            off_rest, on_rest,
+            "开启 delete_shaders 后，除 shaders 之外的条目必须逐条相同"
+        );
+    }
+
+    /// **三个 CIT / 物品定义开关的默认值**：物品定义转换默认开、**CIT 转换默认关**、
+    /// 删除默认关。
+    ///
+    /// 这是"默认产物"的第一道闸门。`convert_cit=false` 是 2026-10 的 A1 止血改默认
+    /// （CIT 的附魔条件在 1.21.9+ 可能让物品定义整份失效 ⇒ 黑紫格，见
+    /// `MixedRunOptions::convert_cit` 的字段注释）；另外两个默认值守住"不改选项时
+    /// 产物不变"：物品定义与着色器任务照跑，删除类一个都不动。
+    #[test]
+    fn cit_switches_default_to_off_on_off() {
+        let opts = MixedRunOptions::default();
+        assert!(opts.convert_item_definitions, "物品定义默认必须开");
+        assert!(
+            !opts.convert_cit,
+            "CIT 转换默认必须关：附魔条件可能让 1.21.9+ 的物品定义整份失效"
+        );
+        assert!(!opts.delete_cit, "删除是破坏性的，默认必须关");
+
+        assert!(plan_task_enabled("generate_item_definitions", &opts));
+        assert!(
+            !plan_task_enabled("generate_cit_item_definitions", &opts),
+            "默认组合下 CIT 转换任务不得派发"
+        );
+        // 其余任务不受影响（这里抽两个不同阶段的代表）
+        assert!(plan_task_enabled("adapt_java_shaders", &opts), "着色器适配默认开");
+        assert!(plan_task_enabled("cut_gui", &opts));
+
+        // 反向确认：显式打开时任务回来——默认关是靠默认值，不是靠删掉任务能力。
+        let on = MixedRunOptions {
+            convert_cit: true,
+            ..MixedRunOptions::default()
+        };
+        assert!(
+            plan_task_enabled("generate_cit_item_definitions", &on),
+            "显式打开 CIT 转换后必须派发"
+        );
+    }
+
+    /// **`adapt_shaders` 开关真的被计划过滤消费**（2026-10 修复 M3 回归）。
+    ///
+    /// 背景：`adapt_shaders` 在 2.1.3 引入时门控任务注册；M3 换成
+    /// `Scheduler::plan` 之后它只被传递、没有消费者，UI 上关掉也照样适配。
+    /// 这条用例钉住"关掉之后 `adapt_java_shaders` 不再派发"，并且不误伤
+    /// 物品定义 / CIT 的任务。
+    #[test]
+    fn adapt_shaders_switch_filters_only_the_shader_task() {
+        let opts = MixedRunOptions {
+            adapt_shaders: false,
+            // 本用例只测「着色器开关不连坐」，因此把 CIT 转换**显式打开**：
+            // A1 之后它的默认值是 false，用默认值会得到"没派发"而与本开关无关。
+            convert_cit: true,
+            ..MixedRunOptions::default()
+        };
+        assert!(
+            !plan_task_enabled("adapt_java_shaders", &opts),
+            "关掉着色器适配后不该派发 adapt_java_shaders"
+        );
+        assert!(
+            plan_task_enabled("generate_item_definitions", &opts),
+            "物品定义开关不该被连坐"
+        );
+        assert!(
+            plan_task_enabled("generate_cit_item_definitions", &opts),
+            "CIT 开关不该被连坐"
+        );
+        assert!(plan_task_enabled("delete_shaders_folder", &opts), "删除任务不受影响");
+    }
+
+    /// **关掉转换项只跳过对应任务，源文件一个字节都不动。**
+    ///
+    /// 三条语义在这里一次性钉住：
+    /// 1. `convert_item_definitions=false`：没有 `items/bow.json`，但 CIT 仍写
+    ///    `items/stick.json`（两条输入路径互不依赖）；
+    /// 2. `convert_cit=false`：没有 `items/stick.json` / `models/cit/**` /
+    ///    `textures/cit/**`，但 `items/bow.json` 照写，**两棵 CIT 源目录仍在**；
+    /// 3. 默认组合（结构体缺省，A1 之后 CIT 默认关）= 显式 (true, false, false) 的
+    ///    产物逐条相同，且**不等于**显式打开 CIT 的产物——后半句保证本用例能看见
+    ///    默认值变化，而不是只证明一次"两边都没 CIT"的巧合。
+    #[test]
+    fn cit_and_item_definition_switches_gate_only_their_own_output() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let input = tmp.path().join("fixture_cit.zip");
+        fixture_cit(&input);
+
+        let (all_zip, _) =
+            native_output_cit_switches(&input, tmp.path(), true, true, false, "all");
+        let all = zip_entry_names(&all_zip);
+        assert!(all.iter().any(|n| n == "assets/minecraft/items/bow.json"), "官方定义任务应写出 bow：{all:?}");
+        assert!(all.iter().any(|n| n == "assets/minecraft/items/stick.json"), "CIT 应写出 stick：{all:?}");
+        assert!(
+            all.iter().any(|n| n == "assets/minecraft/models/cit/test/cmd.json"),
+            "CIT 应写出 models/cit：{all:?}"
+        );
+        assert!(
+            all.iter().any(|n| n == "assets/minecraft/textures/cit/test/cmd.png"),
+            "CIT 应搬运贴图：{all:?}"
+        );
+        let all_cit: Vec<&String> = all.iter().filter(|n| is_cit_path(n)).collect();
+        assert!(!all_cit.is_empty(), "默认必须保留 CIT 源目录");
+
+        // ── 关物品定义：bow 消失，CIT 与源目录都还在 ─────────────────────
+        let (no_def_zip, _) =
+            native_output_cit_switches(&input, tmp.path(), false, true, false, "no_def");
+        let no_def = zip_entry_names(&no_def_zip);
+        assert!(
+            !no_def.iter().any(|n| n == "assets/minecraft/items/bow.json"),
+            "关闭后不该写 bow 定义：{no_def:?}"
+        );
+        assert!(
+            no_def.iter().any(|n| n == "assets/minecraft/items/stick.json"),
+            "CIT 是另一条路径，不该被物品定义开关连坐：{no_def:?}"
+        );
+        assert!(no_def.iter().any(|n| is_cit_path(n)), "源目录必须原样保留");
+
+        // ── 关 CIT：CIT 产物与源目录的关系 ──────────────────────────────
+        let (no_cit_zip, _) =
+            native_output_cit_switches(&input, tmp.path(), true, false, false, "no_cit");
+        let no_cit = zip_entry_names(&no_cit_zip);
+        assert!(
+            no_cit.iter().any(|n| n == "assets/minecraft/items/bow.json"),
+            "关 CIT 不该影响官方定义任务：{no_cit:?}"
+        );
+        assert!(
+            !no_cit.iter().any(|n| n == "assets/minecraft/items/stick.json"),
+            "关 CIT 后不该再写 CIT 定义：{no_cit:?}"
+        );
+        assert!(
+            !no_cit.iter().any(|n| n.starts_with("assets/minecraft/models/cit/")),
+            "关 CIT 后不该留 models/cit：{no_cit:?}"
+        );
+        assert!(
+            !no_cit.iter().any(|n| n.starts_with("assets/minecraft/textures/cit/")),
+            "关 CIT 后不该留 textures/cit：{no_cit:?}"
+        );
+        assert!(
+            no_cit.iter().any(|n| is_cit_path(n)),
+            "**关 CIT 只跳过转换，源文件必须原样保留**（OptiFine 用户还要用）：{no_cit:?}"
+        );
+
+        // ── 两个都关：两边的定义都不写，源目录仍在 ───────────────────────
+        let (neither_zip, _) =
+            native_output_cit_switches(&input, tmp.path(), false, false, false, "neither");
+        let neither = zip_entry_names(&neither_zip);
+        assert!(
+            !neither.iter().any(|n| n == "assets/minecraft/items/bow.json" || n == "assets/minecraft/items/stick.json"),
+            "两项都关时不该有任何新物品定义：{neither:?}"
+        );
+        assert!(neither.iter().any(|n| is_cit_path(n)), "源目录仍在");
+
+        // ── 默认口径 = 显式 (物品定义开, CIT 关, 删除关) 口径（逐条字节）────
+        // A1 之后 `convert_cit` 默认关，所以默认产物必须与 `no_cit` 一致；
+        // 且必须与 `all`（显式开 CIT）不同，否则本断言对默认值的变化是瞎的。
+        let (default_zip, _) =
+            native_output_v2(&input, tmp.path(), 55, 34, NativeSwitches::all(), false, "cit_default");
+        assert_eq!(
+            zip_entry_digests(&no_cit_zip),
+            zip_entry_digests(&default_zip),
+            "默认口径（CIT 关）必须与显式 (true,false,false) 逐条相同"
+        );
+        assert_ne!(
+            zip_entry_digests(&all_zip),
+            zip_entry_digests(&default_zip),
+            "默认口径必须与显式打开 CIT 的产物不同（默认值确实施加了影响）"
+        );
+    }
+
+    /// **`delete_cit`：两棵源目录消失、CIT 转换被跳过、其余条目逐条不变。**
+    ///
+    /// 钉住四件事：
+    /// 1. **默认关**（`deleted_cit == 0`、清理点没有登记任何 CIT 根）；
+    /// 2. 开启后**一条不剩**——含显式目录条目；`deleted_cit` 等于关闭时
+    ///    两棵树里的条目数（含目录）；
+    /// 3. 删除**优先于转换**：即使 `convert_cit=true`，也不该出现
+    ///    `items/stick.json` / `models/cit/**` / `textures/cit/**`；
+    /// 4. 删除走**延迟删除的清理点**：`deferred_removals` 里能看到两个根；
+    ///    并且非 CIT 条目与"只关 CIT、不删除"的产物逐条相同（只该删 CIT）。
+    #[test]
+    fn delete_cit_removes_both_roots_and_nothing_else() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let input = tmp.path().join("fixture_cit.zip");
+        fixture_cit(&input);
+
+        // 对照组：只关 CIT、不删除（源目录保留，CIT 产物不生成）
+        let (off_zip, off_report) =
+            native_output_cit_switches(&input, tmp.path(), true, false, false, "cit_off");
+        let off_entries = zip_entry_names(&off_zip);
+        let off_cit: Vec<&String> = off_entries.iter().filter(|n| is_cit_path(n)).collect();
+        assert!(!off_cit.is_empty(), "夹具必须带 CIT 源目录");
+        assert_eq!(off_report.deleted_cit, 0);
+        assert!(
+            !off_report.deferred_removals.iter().any(|p| CIT_ROOTS.contains(&p.as_str())),
+            "关闭时不该登记 CIT 删除：{:?}",
+            off_report.deferred_removals
+        );
+
+        // 实验组：delete_cit=true，且故意同时保持 convert_cit=true（删除优先）
+        let (on_zip, on_report) =
+            native_output_cit_switches(&input, tmp.path(), true, true, true, "cit_del");
+        let on_entries = zip_entry_names(&on_zip);
+        let leftovers: Vec<&String> = on_entries.iter().filter(|n| is_cit_path(n)).collect();
+        assert!(
+            leftovers.is_empty(),
+            "开启后 CIT 源目录必须一条不剩（含目录条目），残留：{leftovers:?}"
+        );
+        assert_eq!(
+            on_report.deleted_cit,
+            off_cit.len(),
+            "删掉的条目数必须等于关闭时两棵树里的条目数（含目录）"
+        );
+        for root in CIT_ROOTS {
+            assert!(
+                on_report.deferred_removals.iter().any(|p| p == root),
+                "`{root}` 必须登记在延迟删除清单里（清理点时机），实际：{:?}",
+                on_report.deferred_removals
+            );
+        }
+        // 删除优先：CIT 任务被过滤，不该留下任何 CIT 产物
+        assert!(
+            !on_entries.iter().any(|n| n == "assets/minecraft/items/stick.json"),
+            "delete_cit 开启时 CIT 转换必须被跳过（delete 优先）：{on_entries:?}"
+        );
+        assert!(
+            !on_entries.iter().any(|n| n.starts_with("assets/minecraft/models/cit/")
+                || n.starts_with("assets/minecraft/textures/cit/")),
+            "delete_cit 开启时不该有 CIT 生成物：{on_entries:?}"
+        );
+        assert!(
+            on_entries.iter().any(|n| n == "assets/minecraft/items/bow.json"),
+            "物品定义任务不受 delete_cit 影响，仍应写出 bow：{on_entries:?}"
+        );
+        assert_eq!(on_report.deleted_shaders, 0, "CIT 开关不该顺手动 shaders");
+
+        // 只该删 CIT：其余条目与"只关 CIT"的产物逐条相同
+        let off_rest: Vec<_> = zip_entry_digests(&off_zip)
+            .into_iter()
+            .filter(|(n, _, _)| !is_cit_path(n))
+            .collect();
+        let on_rest: Vec<_> = zip_entry_digests(&on_zip)
+            .into_iter()
+            .filter(|(n, _, _)| !is_cit_path(n))
+            .collect();
+        assert_eq!(
+            off_rest, on_rest,
+            "开启 delete_cit 后，除 CIT 源目录外的条目必须逐条相同"
+        );
+    }
+
+    /// **`2pyr-gen` 的注入点在 `run_native` 的 tail**：Zip 与 Dir 两种输出都要带上，
+    /// 默认（`gen_metadata: None`）时产物与改动前逐条相同。
+    ///
+    /// 为什么不只测 Zip：`Output::Dir` 是「tail 提交层 → materialize」另一条路径，
+    /// 若把写入放到 `write_zip` 之前（而不是 tail 事务里），Dir 就会漏。生产入口
+    /// 目前 Java 目标只走 Zip，但"两条输出路径产物一致"是驱动契约，必须自己守。
+    ///
+    /// 另外钉住"只多一个文件"：元数据是纯追加，不得改变其它任何条目。
+    #[test]
+    fn gen_metadata_lands_in_both_zip_and_dir_outputs() {
+        // 默认必须是"不写"：其它 run_native 调用方（overlay / foray / 单测）的产物
+        // 不能因为新增这个字段而变化。
+        assert!(
+            MixedRunOptions::default().gen_metadata.is_none(),
+            "默认必须不写元数据，否则所有调用方的产物都会多一个文件"
+        );
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let input = tmp.path().join("fixture_meta.zip");
+        fixture(&input);
+
+        let meta = crate::gen_metadata::build(
+            34,
+            55,
+            Some("Java 1.21.5"),
+            crate::gen_metadata::GenOptions {
+                fix_alpha_layers: false,
+                adapt_shaders: true,
+                delete_shaders: false,
+                convert_item_definitions: true,
+                convert_cit: false,
+                delete_cit: false,
+            },
+        );
+        let expected = meta.to_json_bytes().expect("serialize metadata");
+
+        fn write_target_mcmeta(tx: &mut crate::arom::Tx<'_>, target: u32) -> Result<(), String> {
+            if tx.exists("pack.mcmeta") {
+                let cur = tx.text("pack.mcmeta").map_err(|e| e.to_string())?;
+                let next = crate::pack::version_converter::rewrite_pack_mcmeta_text(&cur, target)?;
+                tx.put("pack.mcmeta", next.into_bytes())
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        }
+
+        let run_zip = |with_meta: bool, tag: &str| -> PathBuf {
+            let work = tmp.path().join(format!("meta_work_{tag}"));
+            let out = tmp.path().join(format!("meta_{tag}.zip"));
+            let opts = MixedRunOptions {
+                source_version: 34,
+                target_version: 55,
+                native: NativeSwitches::all(),
+                gen_metadata: with_meta.then(|| meta.clone()),
+                ..MixedRunOptions::default()
+            };
+            run_native(
+                &input,
+                &work,
+                &Output::Zip(out.clone()),
+                &opts,
+                |tx| write_target_mcmeta(tx, 55),
+            )
+            .expect("run_native zip");
+            out
+        };
+        let run_dir = |with_meta: bool, tag: &str| -> PathBuf {
+            let work = tmp.path().join(format!("meta_work_{tag}"));
+            let out = tmp.path().join(format!("meta_{tag}_dir"));
+            let opts = MixedRunOptions {
+                source_version: 34,
+                target_version: 55,
+                native: NativeSwitches::all(),
+                gen_metadata: with_meta.then(|| meta.clone()),
+                ..MixedRunOptions::default()
+            };
+            run_native(
+                &input,
+                &work,
+                &Output::Dir(out.clone()),
+                &opts,
+                |tx| write_target_mcmeta(tx, 55),
+            )
+            .expect("run_native dir");
+            out
+        };
+
+        // ── Zip：开启时多恰好一个文件，内容就是 builder 的序列化结果 ──────
+        let zip_with = run_zip(true, "with");
+        let zip_without = run_zip(false, "without");
+        let names_with = zip_entry_names(&zip_with);
+        let names_without = zip_entry_names(&zip_without);
+        assert!(
+            names_with.iter().any(|n| n == crate::gen_metadata::FILE_NAME),
+            "开启时产物根必须有 {}：{names_with:?}",
+            crate::gen_metadata::FILE_NAME
+        );
+        assert!(
+            !names_without
+                .iter()
+                .any(|n| n == crate::gen_metadata::FILE_NAME),
+            "默认 None 时产物里不得有该文件：{names_without:?}"
+        );
+        assert_eq!(
+            names_with.len(),
+            names_without.len() + 1,
+            "元数据是纯追加：开启只应多一个条目"
+        );
+        let rest_with: Vec<_> = zip_entry_digests(&zip_with)
+            .into_iter()
+            .filter(|(n, _, _)| n != crate::gen_metadata::FILE_NAME)
+            .collect();
+        assert_eq!(
+            rest_with,
+            zip_entry_digests(&zip_without),
+            "除元数据外，产物必须逐条相同（开关不得扰动其它字节）"
+        );
+        let zip_meta_bytes = {
+            use std::io::Read as _;
+            let f = std::fs::File::open(&zip_with).expect("open");
+            let mut ar = zip::ZipArchive::new(f).expect("zip");
+            let mut e = ar
+                .by_name(crate::gen_metadata::FILE_NAME)
+                .expect("by_name");
+            let mut buf = Vec::new();
+            e.read_to_end(&mut buf).expect("read");
+            buf
+        };
+        assert_eq!(
+            zip_meta_bytes, expected,
+            "写入的字节必须等于 builder 的序列化结果"
+        );
+
+        // ── Dir：同一条 tail 路径，必须落盘且内容一致 ────────────────────
+        let dir_with = run_dir(true, "with");
+        let dir_bytes = std::fs::read(dir_with.join(crate::gen_metadata::FILE_NAME))
+            .expect("Dir 产物必须含 2pyr-gen.json");
+        assert_eq!(dir_bytes, expected, "Zip 与 Dir 的元数据内容必须一致");
+        // Dir 默认（None）不得出现该文件
+        let dir_without = run_dir(false, "without");
+        assert!(
+            !dir_without.join(crate::gen_metadata::FILE_NAME).exists(),
+            "默认 None 时 Dir 产物不得有该文件"
+        );
+    }
+
+    /// **`adapt_shaders=false` 真的把任务从计划里去掉**（不只停留在纯函数）。
+    ///
+    /// 纯函数用例只证明 `plan_task_enabled` 的返回值；这条跑完整 `run_native`，
+    /// 用 `native_names` 观察"任务到底有没有被派发"。夹具带两棵 shaders 树，
+    /// 所以 `adapt_java_shaders` 一定会出现在 34→55 的计划里。
+    #[test]
+    fn adapt_shaders_false_removes_the_task_from_the_plan() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let input = tmp.path().join("fixture_shaders.zip");
+        fixture_ex(&input, true);
+
+        let run = |adapt: bool, tag: &str| {
+            let work = tmp.path().join(format!("adapt_work_{tag}"));
+            let out = tmp.path().join(format!("adapt_{tag}.zip"));
+            let opts = MixedRunOptions {
+                source_version: 34,
+                target_version: 55,
+                adapt_shaders: adapt,
+                native: NativeSwitches::all(),
+                ..MixedRunOptions::default()
+            };
+            let report = run_native(&input, &work, &Output::Zip(out), &opts, |tx| {
+                if tx.exists("pack.mcmeta") {
+                    let cur = tx.text("pack.mcmeta").map_err(|e| e.to_string())?;
+                    let next =
+                        crate::pack::version_converter::rewrite_pack_mcmeta_text(&cur, 55)?;
+                    tx.put("pack.mcmeta", next.into_bytes())
+                        .map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            })
+            .expect("run_native with adapt_shaders");
+            report
+        };
+
+        let on = run(true, "on");
+        let off = run(false, "off");
+        assert!(
+            on.native_names.iter().any(|n| n == "adapt_java_shaders"),
+            "默认必须派发 adapt_java_shaders：{:?}",
+            on.native_names
+        );
+        assert!(
+            !off.native_names.iter().any(|n| n == "adapt_java_shaders"),
+            "关闭后不该派发：{:?}",
+            off.native_names
+        );
+        assert_eq!(
+            off.plan_len + 1,
+            on.plan_len,
+            "关掉一个任务后计划长度必须恰好少 1"
+        );
+    }
+
+    /// **8c 的第一批验收**：把 textures 已迁移任务改为原生执行，产物必须与「全走适配层」
+    /// 以及旧管线都逐项一致；开关关闭时行为必须与打开前完全相同。
+    ///
+    /// §9.125：`off` / `legacy` 两配置的实现是**旧闭包**，默认构建里不存在，因此
+    /// 「与旧实现对照」的部分随旧实现一起删除（`legacy-oracle` feature 从未实现）；保留 **`on` 自身的一致性**
+    /// （每个计划任务恰好执行一次、原生数 ≥ 1），它与夹具闸门一起构成默认判据。
+    #[test]
+    fn native_switch_keeps_the_output_identical_on_a_fixture() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let input = tmp.path().join("fixture.zip");
+        fixture(&input);
+
+        // 1 → 97 会经过 (5,6)/(7,8) 两段，因此能选中已迁移的 Eraser 任务
+        let (on, on_report) =
+            native_output_v2(&input, tmp.path(), 97, 1, NativeSwitches::all(), false, "on");
+
+        // §9.102：`cut_gui` 的实现**无条件**是原生模块（§9.101，由注册闭包直接调用），
+        // 不受 `NativeSwitches` 影响；而本夹具（1→97）的计划里**确实含** `cut_gui`，
+        // 因此「开关全关」时原生数为 **1**（就是它）、适配层为 `plan_len - 1`。
+        assert_eq!(
+            on_report.native_tasks + on_report.legacy_tasks,
+            on_report.plan_len,
+            "每个计划任务必须恰好执行一次"
+        );
+        assert!(
+            on_report.native_tasks >= 1,
+            "该版本对应当命中已迁移任务，实际原生：{:?}",
+            on_report.native_names
+        );
+
+    }
+
+    /// **真实包上的绝对产物契约**（默认忽略，§9.91）。
+    ///
+    /// **为什么必须有这个用例**：其余真实包用例都是「legacy vs mixed」的**相对**对照——
+    /// 如果某个改动让**两条路径一起**少产出文件，它们仍然彼此相等、全部报绿。
+    /// §9.91 实测到过这个盲区：把 `cut_gui` 移出计划后产物从 **4018 文件 / 19294735 字节**
+    /// 掉到 **4015 / 19293011**（少 3 个文件、1724 字节），而**全部 18 个忽略用例依然通过**。
+    ///
+    /// 因此这里把**绝对值**钉住（文件数 / 字节数）。这些数字是「TapL 16x + 目标 97」这一
+    /// 固定输入的**已确认基线**；它们变化时应当**先解释清楚为什么**，再更新本用例。
+    #[test]
+    #[ignore]
+    fn real_pack_absolute_output_is_pinned() {
+        let Ok(src) = std::env::var("AROM_REAL_PACK") else {
+            println!("AROM_REAL_PACK 未设置，跳过");
+            return;
+        };
+        let input = PathBuf::from(&src);
+        assert!(input.is_file(), "不是文件：{}", input.display());
+        let target: u32 = std::env::var("AROM_TARGET")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(97);
+        let source = {
+            let pack = Pack::open_zip(&input, &SafeLimits::preserving_current(), None)
+                .expect("open for source format");
+            pack.view()
+                .mcmeta()
+                .ok()
+                .and_then(|m| m.effective_format())
+                .unwrap_or(34)
+        };
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // §9.125：本用例原先用 `native_output`（= 开关全关 `off`）。默认构建里 `off` 没有实现
+        // （旧闭包已被删除），因此改为**生产口径 `on`**——这正好落实
+        // 交接文档第 4 步：「默认（无 feature）时，`on` 配置与真实包对照」。
+        // 判据强度不变：绝对计数是**独立于任何配置**的产物契约。
+        let (_mixed, report) =
+            native_output_v2(&input, tmp.path(), target, source, NativeSwitches::all(), false, "abs");
+        let stats = &report.stats;
+
+        println!(
+            "绝对产物：files={} bytes={}（输入 {} → 目标 {}）",
+            stats.files, stats.bytes, source, target
+        );
+
+        // **不设计数基线**（原为 4018 文件 / 19294735 字节）。
+        //
+        // 同样的理由：产物变化被有意为之的那些改动（修九宫格边厚、加物品模型定义）
+        // 一次次要求同步改这个数字。绝对计数作为契约只在「产物不该变」的时期成立，
+        // 那个时期已经结束了。需要比对时导出清单逐行 diff，比一个总数信息量大得多。
+        println!(
+            "绝对产物基线 = files {} / bytes {}（仅供参考，不参与判定）",
+            stats.files, stats.bytes
+        );
+    }
+
+    /// **②-a 内容指纹**：报告真实包产物的内容指纹（§9.115；**已不再冻结**）。
+    ///
+    /// **为什么必须有它**（§9.112/§9.114 的结论）：第 ② 项"移除旧闭包路径"的**真正阻塞
+    /// 不是功能，而是验证依赖**——闸门一直靠"与旧管线 `legacy` 对照"来定义正确性，
+    /// 因此**旧闭包不能删**（删了就是拆掉自己的尺子）。
+    ///
+    /// 本用例给出**独立于旧实现**的判据：把产物 zip 的
+    /// `(条目名, 长度, 内容 FNV-1a)` 排序后聚合成**一个 u64 指纹**。
+    ///
+    /// **它现在只报告，不判定。** 原先与一个冻结常量比对，用来在产物内容变化时报红；
+    /// 但它后来挡住的是**有意的改动**（修九宫格边厚、加物品模型定义），
+    /// 每次都要先改常量，哨兵就成了「改代码时必须同步更新的数字」。
+    /// 需要判定时导出清单与上一版逐行 diff —— 那才回答「这版和上版差在哪」。
+    ///
+    /// **它比 §9.91 的绝对契约强在哪**：绝对契约只钉 `files` / `bytes` 两个**计数**——
+    /// 若某次改动让两个文件互换内容（计数不变），绝对契约**看不见**，而本用例会红。
+    ///
+    /// 用 `AROM_BASELINE_DUMP=<路径>` 导出**逐条目清单**；
+    /// 两份清单逐行 diff 即可定位是哪些文件变了。仓库内 `tools/arom-baseline.txt`
+    /// 是 2.201.0 时期的一份快照，仅作历史参考，不再被断言。
+    /// **1.21.4+ 物品模型定义的整条管线验收**（两段合成一条）。
+    ///
+    /// 为什么必须有这一条：两个新任务的**单元测试各自都过了**，但单元测试证明的是
+    /// 「任务自己写对了文件」，证明不了「它们在真实计划里挂对了位置」——
+    /// 而这块能力最容易错的就是**位置**：
+    ///
+    /// * `generate_item_definitions` 挂在 `(42,46)`：早一步（42 还没到）或晚一步
+    ///   （进旧批次）都会让产物分叉；
+    /// * `generate_cit_item_definitions` 挂在 `(46,55)`：它读 `optifine/cit/**`，
+    ///   而该目录由 Eraser 级的 `rename_mcpatcher_to_optifine`（槽位 8→9）从
+    ///   `mcpatcher/cit/**` 改名而来。**若挂早一个阶段，它就永远看不到文件**——
+    ///   而这种错误在单元测试里根本不会暴露（单元测试直接造好 `optifine/` 目录）。
+    ///
+    /// 因此本用例**只从 `mcpatcher/cit/` 出发**（不预置 `optifine/`），走完整的
+    /// `34 → 55` 计划，要求两条链都真的跑通。
+    #[test]
+    fn modern_item_definitions_survive_the_whole_pipeline() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let input = tmp.path().join("items_fixture.zip");
+        {
+            let f = std::fs::File::create(&input).expect("create fixture");
+            let mut zip = zip::ZipWriter::new(f);
+            let opts = zip::write::FileOptions::default();
+            let mut add = |name: &str, body: Vec<u8>| {
+                zip.start_file(name, opts).expect("start");
+                zip.write_all(&body).expect("write");
+            };
+            add(
+                "pack.mcmeta",
+                br#"{"pack":{"pack_format":34,"description":"items"}}"#.to_vec(),
+            );
+            // ① 原版 `overrides` 机制：弓（含 CMD 自定义外观）
+            add(
+                "assets/minecraft/models/item/bow.json",
+                br#"{"parent":"item/generated",
+                     "textures":{"layer0":"item/bow"},
+                     "overrides":[{"predicate":{"custom_model_data":1000},"model":"mypack:item/ruby_bow"}]}"#
+                    .to_vec(),
+            );
+            // ② OptiFine CIT 机制：**故意放在旧路径 `mcpatcher/`**，逼着改名任务先跑
+            add(
+                "assets/minecraft/mcpatcher/cit/ruby/ruby_sword.properties",
+                b"type=item\nitems=diamond_sword\ntexture=ruby_sword.png\nnbt.CustomModelData=7\n"
+                    .to_vec(),
+            );
+            add(
+                "assets/minecraft/mcpatcher/cit/ruby/ruby_sword.png",
+                png((16, 16)),
+            );
+            zip.finish().expect("finish");
+        }
+
+        // 前置：两个任务都必须真的在这条路径的**计划里**（否则下面的断言会因为
+        // 一个更无聊的原因失败——"任务根本没跑"，而不是"跑错了"）。
+        {
+            let sched = crate::arom::engine::scheduler::Scheduler::new();
+            let plan = sched.plan(34, 55).expect("plan");
+            for name in ["generate_item_definitions", "generate_cit_item_definitions"] {
+                assert!(
+                    plan.iter().any(|t| t == name),
+                    "{name} 不在 34→55 的计划里：{plan:?}"
+                );
+                assert!(
+                    native_for(name, &NativeSwitches::all()).is_some(),
+                    "{name} 在计划里但派发表里没有实现"
+                );
+            }
+        }
+        // A1 之后 `convert_cit` 默认关，本用例测的是"CIT 那条腿能走完整管线"，
+        // 因此**显式打开**；否则它只会证明"关着的时候什么都没生成"，而任务能力本身
+        // 没有任何端到端覆盖（真实包的默认值语义由 `cit_switches_default_to_off_on_off` 守）。
+        let opts = MixedRunOptions {
+            source_version: 34,
+            target_version: 55,
+            convert_cit: true,
+            native: NativeSwitches::all(),
+            ..MixedRunOptions::default()
+        };
+        let (out, _report) = native_output_v2_opts(&input, tmp.path(), opts, "items");
+        let pack = Pack::open_zip(&out, &SafeLimits::preserving_current(), None).expect("open out");
+
+        // ① `overrides` 的那条腿：弓的定义存在，且外层接上了包的 CMD 表
+        let bow = pack
+            .view()
+            .json("assets/minecraft/items/bow.json")
+            .expect("bow 的物品定义必须存在");
+        assert_eq!(bow["model"]["property"], "minecraft:has_component");
+        assert_eq!(
+            bow["model"]["on_true"]["entries"][0]["model"]["model"],
+            "mypack:item/ruby_bow"
+        );
+
+        // ② CIT 的那条腿：定义 + 生成的模型 + 被搬进标准贴图目录的图
+        let sword = pack
+            .view()
+            .json("assets/minecraft/items/diamond_sword.json")
+            .expect("CIT 生成的物品定义必须存在");
+        // 数字 CMD 必须是 range_dispatch（旧实现写 select + 数字 when，客户端
+        // 解析失败 ⇒ 紫黑格；这条断言就是防止回归的形状守卫）。
+        assert_eq!(sword["model"]["type"], "minecraft:condition");
+        assert_eq!(sword["model"]["property"], "minecraft:has_component");
+        assert_eq!(
+            sword["model"]["on_true"]["property"],
+            "minecraft:custom_model_data"
+        );
+        assert_eq!(sword["model"]["on_true"]["entries"][0]["threshold"], 7);
+        assert_eq!(
+            sword["model"]["on_true"]["entries"][0]["model"]["model"],
+            "minecraft:cit/ruby/ruby_sword"
+        );
+        let model = pack
+            .view()
+            .json("assets/minecraft/models/cit/ruby/ruby_sword.json")
+            .expect("CIT 生成的模型必须存在");
+        assert_eq!(model["parent"], "minecraft:item/handheld", "`_sword` 后缀 ⇒ 手持类");
+        assert_eq!(model["textures"]["layer0"], "cit/ruby/ruby_sword");
+        assert!(
+            pack.view()
+                .resolve("assets/minecraft/textures/cit/ruby/ruby_sword.png")
+                .is_some(),
+            "CIT 贴图必须被搬进 assets/minecraft/textures/（否则客户端加载不到）"
+        );
+        // **旧路径原样保留——这是实测出来的事实，不是"应该"。**
+        //
+        // `rename_mcpatcher_to_optifine` 挂在 `(7,8)` 边上，而 34→55 的转换路径是
+        // 34→42→46→55，**根本不经过那条边**。所以 `mcpatcher/cit/**` 会留在包里，
+        // CIT 任务**不能**依赖那次改名——它同时扫 `mcpatcher/cit` 与 `optifine/cit`
+        // （`cit_item_definitions::ROOTS`）。
+        //
+        // 本断言就是这个决定的守卫：哪天有人"顺手"把 CIT 任务改成只扫 `optifine/`，
+        // 这里会红，而不是让所有 1.7 时代的老包**静默丢掉全部 CIT**。
+        assert!(
+            pack.view()
+                .resolve("assets/minecraft/mcpatcher/cit/ruby/ruby_sword.properties")
+                .is_some(),
+            "34→55 不经过 (7,8)，mcpatcher/ 应原样保留（CIT 任务必须自己兼容它）"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn real_pack_content_baseline_is_frozen() {
+        let Ok(src) = std::env::var("AROM_REAL_PACK") else {
+            println!("AROM_REAL_PACK 未设置，跳过");
+            return;
+        };
+        let input = PathBuf::from(&src);
+        assert!(input.is_file(), "不是文件：{}", input.display());
+        let target: u32 = std::env::var("AROM_TARGET")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(97);
+        let source = {
+            let pack = Pack::open_zip(&input, &SafeLimits::preserving_current(), None)
+                .expect("open for source format");
+            pack.view()
+                .mcmeta()
+                .ok()
+                .and_then(|m| m.effective_format())
+                .unwrap_or(34)
+        };
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // §9.125（交接文档第 4 步的落点）：**默认构建下本用例与 `on` 配置对照**，
+        // 而不是与 `off` 对照——`off` 的实现（88 个旧闭包）已被删除，
+        // 默认构建里没有它。`on` 正是**生产配置**，所以这条对照反而更贴近真实产物。
+        //
+        // 旧的 `--features legacy-oracle` 对照路径已不存在；`on` 与 `off` 曾产出同一份内容（由
+        // `native_switch_keeps_the_output_identical_on_a_real_pack` 把关），
+        // 因此本指纹在两种构建下必须一致——这本身就是一条额外约束。
+        let (mixed, _report) =
+            native_output_v2(&input, tmp.path(), target, source, NativeSwitches::all(), false, "frozen");
+
+        // 逐条目 (名, 长度, 内容 hash) → 排序 → 聚合成一个 u64
+        let entries = zip_entry_digests(&mixed);
+        let mut agg: u64 = 0xcbf2_9ce4_8422_2325;
+        for (name, len, h) in &entries {
+            for b in name.as_bytes() {
+                agg ^= *b as u64;
+                agg = agg.wrapping_mul(0x1000_0000_01b3);
+            }
+            for b in len.to_le_bytes().iter().chain(h.to_le_bytes().iter()) {
+                agg ^= *b as u64;
+                agg = agg.wrapping_mul(0x1000_0000_01b3);
+            }
+        }
+
+        println!(
+            "内容基线：{} 个条目，聚合指纹 = 0x{agg:016x}",
+            entries.len()
+        );
+
+        // 可选：导出逐条目清单（用于与 tools/arom-baseline.txt 做 diff）
+        if let Ok(path) = std::env::var("AROM_BASELINE_DUMP") {
+            let mut text = String::new();
+            for (name, len, h) in &entries {
+                text.push_str(&format!("{h:016x}  {len:>9}  {name}\n"));
+            }
+            std::fs::write(&path, text).expect("dump baseline");
+            println!("已导出逐条目清单到 {path}");
+        }
+
+        // **不设冻结常量。**
+        //
+        // 这里原本钉着一个实测值（TapL 16x → 97，2026-10-05，4018 个条目），
+        // 用来在产物内容变化时报红。它后来挡住的不是回归，而是**有意的改动** ——
+        // 修九宫格边厚、加物品模型定义，每一次都要先去改那个常量，
+        // 于是「基线」变成了「改代码时必须同步更新的数字」，失去了哨兵的意义。
+        //
+        // 现在它只**报告**，不判定。要拿到当前基线：
+        //     AROM_REAL_PACK=<包> AROM_BASELINE_DUMP=<输出路径> \
+        //       cargo test --lib real_pack_content_baseline_is_frozen -- --ignored --nocapture
+        // 两次运行之间比较导出的清单（逐行 diff）才是真正有用的用法 ——
+        // 它回答「这一版和上一版差在哪」，而不是「和某个四个月前的数字差在哪」。
+        println!("内容指纹 = 0x{agg:016x}（仅供参考，不参与判定）");
+    }
+
+    /// 读 zip 的全部条目，返回排序后的 `(名字, 长度, 内容 FNV-1a)`。
+    fn zip_entry_digests(zip_path: &Path) -> Vec<(String, u64, u64)> {
+        use std::io::Read as _;
+        let f = std::fs::File::open(zip_path).expect("open zip");
+        let mut ar = zip::ZipArchive::new(f).expect("zip");
+        let mut out = Vec::new();
+        for i in 0..ar.len() {
+            let Ok(mut e) = ar.by_index(i) else { continue };
+            if e.is_dir() {
+                continue;
+            }
+            let name = e.name().to_string();
+            let mut bytes = Vec::new();
+            if e.read_to_end(&mut bytes).is_err() {
+                continue;
+            }
+            let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+            for b in &bytes {
+                hash ^= *b as u64;
+                hash = hash.wrapping_mul(0x1000_0000_01b3);
+            }
+            out.push((name, bytes.len() as u64, hash));
+        }
+        out.sort();
+        out
+    }
+
+    /// **`Output::Dir` 与 `Output::Zip` 必须产出同一份内容**（默认忽略，§9.117）。
+    ///
+    /// 这是生产入口改道（②-b）的**前置判据**：生产要的不是 zip，而是
+    /// 「跑完整条 A-ROM 管线之后的**工作目录**」（它随后还要写 `pack.mcmeta`、跑 Bedrock、重打包）。
+    /// 因此必须先证明"物化回目录"与"序列化成 zip"两者内容一致——
+    /// 否则改道会在**每一次真实转换**上改变产物。
+    #[test]
+    #[ignore]
+    fn native_output_dir_matches_zip_on_a_real_pack() {
+        let Ok(src) = std::env::var("AROM_REAL_PACK") else {
+            println!("AROM_REAL_PACK 未设置，跳过");
+            return;
+        };
+        let input = PathBuf::from(&src);
+        assert!(input.is_file(), "不是文件：{}", input.display());
+        let target: u32 = std::env::var("AROM_TARGET")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(97);
+        let source = {
+            let pack = Pack::open_zip(&input, &SafeLimits::preserving_current(), None)
+                .expect("open for source format");
+            pack.view()
+                .mcmeta()
+                .ok()
+                .and_then(|m| m.effective_format())
+                .unwrap_or(34)
+        };
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // §9.125：`legacy_output` 需要旧闭包 ⇒ 默认构建下不做「旧管线 ↔ 两个形态」的三方对照，
+        // 改为 **Zip 形态 ↔ Dir 形态** 两方对照——生产改道（②-b）关心的正是这一条。
+
+        // ① Zip 形态 → 解到目录
+        let (zip_path, _r1) = native_output_v2(
+            &input, tmp.path(), target, source, NativeSwitches::all(), false, "zip",
+        );
+        let zip_dir = tmp.path().join("zip_extracted");
+        std::fs::create_dir_all(&zip_dir).expect("mkdir");
+        crate::pack::io::extract_resource_pack(
+            zip_path.to_str().expect("utf8"),
+            zip_dir.to_str().expect("utf8"),
+        )
+        .expect("extract zip output");
+
+        // ② Dir 形态
+        // **刻意先往目标目录塞"陈旧文件与陈旧子目录"**：生产传进来的目录正是它自己解压出的
+        // 源树（§9.116），里面必然有"新视图里已不存在"的条目。若 `Output::Dir` 不清空目标，
+        // 这些残留会留在产物里 ⇒ 本用例会红。这是对"清空"这一步的真实检验。
+        let dir_out = tmp.path().join("dir_out");
+        std::fs::create_dir_all(dir_out.join("assets/minecraft/textures/stale_dir")).expect("mkdir stale");
+        std::fs::write(dir_out.join("stale_top.txt"), b"stale").expect("write stale");
+        std::fs::write(
+            dir_out.join("assets/minecraft/textures/stale_dir/stale.png"),
+            b"stale",
+        )
+        .expect("write stale2");
+        {
+            let work = tmp.path().join("v2dir_work");
+            let mut opts = MixedRunOptions::default();
+            opts.source_version = source;
+            opts.target_version = target;
+            opts.native = NativeSwitches::all();
+            let _ = run_native(&input, &work, &Output::Dir(dir_out.clone()), &opts, |tx| {
+                if tx.exists("pack.mcmeta") {
+                    let cur = tx.text("pack.mcmeta").map_err(|e| e.to_string())?;
+                    let next =
+                        crate::pack::version_converter::rewrite_pack_mcmeta_text(&cur, target)?;
+                    tx.put("pack.mcmeta", next.into_bytes())
+                        .map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            })
+            .expect("run_native into dir");
+        }
+
+        // 对照：Zip 形态 ↔ Dir 形态（开 feature 时另加旧管线一侧）
+        let _ = assert_equivalent(&zip_dir, &dir_out);
+        println!("Output::Zip 与 Output::Dir 逐项一致");
+    }
+
+
+
+}

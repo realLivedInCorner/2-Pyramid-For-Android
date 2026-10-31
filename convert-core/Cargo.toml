@@ -1,6 +1,6 @@
 [package]
 name = "convert-core"
-version = "2.0.0"
+version = "2.1.0"
 description = "2-Pyramid for Android convert-core"
 authors = ["2-Pyramid Studio"]
 edition = "2021"
@@ -24,6 +24,11 @@ regex = "1"
 lazy_static = "1"
 rayon = "1.9"
 once_cell = "1.19"
+# Android 适配（桌面 2.203.0 M3 引擎新增依赖，见 CONTRACT §9-3）：
+# * sha2 —— `arom/pathview.rs`、`native_run.rs` 的逐条目 SHA-256；
+# * flate2 —— `arom/source.rs` 的 `DirSource::crc32`（`pack::diff` 使用）。
+sha2 = "0.10"
+flate2 = "1.0"
 uniffi = { version = "0.32" }
 
 [build-dependencies]
@@ -34,7 +39,10 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = "debuginfo"
-panic = "abort"
+# **Android 适配（CONTRACT §9-6）**：桌面/旧 Android 用 abort 是为了体积与"不吞异常"，
+# 但 UniFFI 0.32 的 `catch_unwind` 在 abort 下会直接杀进程（前台服务闪退、Kotlin 收不到
+# 异常）；M3 引擎生产代码有 14 处 `unwrap/expect`。改为 unwind 让 UniFFI 的异常边界成立。
+panic = "unwind"
 
 # cdylib 必须保留 uniffi_* 导出符号供 uniffi-bindgen 找 metadata block。
 # strip = "debuginfo" 只剥 DWARF debug info，不动 function 符号。
