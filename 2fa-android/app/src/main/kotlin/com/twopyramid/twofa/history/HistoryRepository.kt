@@ -21,11 +21,13 @@ data class HistoryRecord(
     val id: String,
     val fileName: String,
     val timestamp: Long,                  // epoch ms
-    val sourceVersion: Int,
+    val sourceVersion: Int,               // 源 pack_format（Bedrock 源 = 1000；未知 = 0）
     val targetVersion: Int,
     val outputPath: String?,              // null if Failed
     val status: Status,
     val durationMs: Long,                 // 转换耗时
+    val skipped: Int = 0,                 // 引擎跳过的任务/条目数（Rust ConvertReport.skipped）
+    val notes: List<String> = emptyList(),// 引擎 notes：既有跳过原因也有普通进展，UI 不能统一标「跳过」
 ) {
     sealed class Status {
         object Done : Status()
@@ -43,6 +45,9 @@ object HistoryRepository {
     private const val PREFS = "twofa.history"
     private const val KEY_RECORDS = "records"
     private const val MAX_RECORDS = 500
+
+    /** 单条历史最多保存的 notes 条数（防 SharedPreferences 膨胀；引擎实际通常 < 100）。 */
+    private const val MAX_NOTES = 100
 
     private lateinit var prefs: SharedPreferences
     private val _records = MutableStateFlow<List<HistoryRecord>>(emptyList())
@@ -111,6 +116,9 @@ object HistoryRepository {
         put("durationMs", r.durationMs)
         put("statusKind", if (r.status is HistoryRecord.Status.Done) "done" else "failed")
         if (r.status is HistoryRecord.Status.Failed) put("failureReason", r.status.reason)
+        // v2.1 新增字段：老版本读新 JSON 会忽略；新版本读老 JSON 用 opt 兜底默认值。
+        put("skipped", r.skipped)
+        put("notes", JSONArray().apply { r.notes.take(MAX_NOTES).forEach { put(it) } })
     }
 
     private fun fromJson(o: JSONObject): HistoryRecord {
@@ -119,6 +127,9 @@ object HistoryRepository {
         } else {
             HistoryRecord.Status.Failed(o.optString("failureReason", "未知错误"))
         }
+        val notes: List<String> = o.optJSONArray("notes")?.let { arr ->
+            (0 until arr.length()).mapNotNull { i -> arr.optString(i, "").takeIf { it.isNotBlank() } }
+        } ?: emptyList()
         return HistoryRecord(
             id = o.optString("id"),
             fileName = o.optString("fileName"),
@@ -128,6 +139,8 @@ object HistoryRepository {
             outputPath = o.optString("outputPath").takeUnless { it == "null" || it.isEmpty() },
             status = status,
             durationMs = o.optLong("durationMs"),
+            skipped = o.optInt("skipped", 0),
+            notes = notes,
         )
     }
 }

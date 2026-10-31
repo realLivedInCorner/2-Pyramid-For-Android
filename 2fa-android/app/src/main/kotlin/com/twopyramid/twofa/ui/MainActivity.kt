@@ -1,7 +1,10 @@
 package com.twopyramid.twofa.ui
 
+import android.graphics.Color as AndroidColor
+import android.graphics.drawable.ColorDrawable
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.animation.core.LinearEasing
@@ -11,12 +14,16 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -26,22 +33,57 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
-import androidx.compose.foundation.shape.CircleShape
+import com.twopyramid.twofa.settings.SettingsRepository
+import com.twopyramid.twofa.settings.ThemeMode
 import com.twopyramid.twofa.ui.theme.BlueAccent
 import com.twopyramid.twofa.ui.theme.TwoFATheme
 import kotlin.math.roundToInt
 
 class MainActivity : ComponentActivity() {
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        enableEdgeToEdge()
+
+        // 首帧前同步读设置（TwoFAApp.onCreate 已完成 SettingsRepository.init，这里幂等兜底）：
+        // 提前把 window 背景设成目标主题的底色，避免深色/浅色用户启动时先闪一帧反色。
+        SettingsRepository.init(this)
+        val initialDark = SettingsRepository.resolveDarkTheme(this)
+        window.setBackgroundDrawable(
+            ColorDrawable(if (initialDark) DARK_WINDOW_BG else LIGHT_WINDOW_BG),
+        )
+        applySystemBars(initialDark)
+
         setContent {
-            TwoFATheme(darkTheme = false) {
+            val themeMode by SettingsRepository.themeMode.collectAsState()
+            val darkTheme = when (themeMode) {
+                ThemeMode.LIGHT -> false
+                ThemeMode.DARK -> true
+                ThemeMode.SYSTEM -> isSystemInDarkTheme()
+            }
+
+            // 主题切换后同步系统栏图标明暗（深色背景 → 浅色图标）
+            LaunchedEffect(darkTheme) { applySystemBars(darkTheme) }
+
+            TwoFATheme(darkTheme = darkTheme) {
                 VortexBackground {
                     AppNavHost()
                 }
             }
         }
+    }
+
+    private fun applySystemBars(dark: Boolean) {
+        val style = if (dark) {
+            SystemBarStyle.dark(AndroidColor.TRANSPARENT)
+        } else {
+            SystemBarStyle.light(AndroidColor.TRANSPARENT, AndroidColor.TRANSPARENT)
+        }
+        enableEdgeToEdge(statusBarStyle = style, navigationBarStyle = style)
+    }
+
+    private companion object {
+        private const val LIGHT_WINDOW_BG = 0xFFFFFFFF.toInt()
+        private const val DARK_WINDOW_BG = 0xFF0A0D11.toInt()
     }
 }
 

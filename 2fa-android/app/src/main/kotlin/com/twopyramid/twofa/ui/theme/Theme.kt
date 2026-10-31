@@ -1,60 +1,74 @@
 package com.twopyramid.twofa.ui.theme
 
-import android.os.Build
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
-import androidx.compose.material3.dynamicDarkColorScheme
-import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.ReadOnlyComposable
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 
-// ── PC 端对齐：默认蓝色主题，light 模式为主 ──
-// 原始 / Huricane 端：--theme-color 默认 #007bff，白底背景。
+// ── PC 端对齐：默认蓝色主题（品牌色不随深/浅色变化）──
+// 原始 / Hurricane 端：--theme-color 默认 #007bff，白底背景。
 // 2FA Android 端 v1.x 误用金棕，v2 起回归 PC 端品牌。
 internal val BlueAccent        = Color(0xFF007BFF)   // PC 端默认
-internal val BlueAccentDeep   = Color(0xFF0056B3)
-internal val BlueAccentSoft   = Color(0xFF66B2FF)
+internal val BlueAccentDeep    = Color(0xFF0056B3)
+internal val BlueAccentSoft    = Color(0xFF66B2FF)
 
-// ── Slate (中性冷色，比 GoldPyramid 暖色更克制) ──
-internal val Slate50          = Color(0xFFF8FAFC)   // 极浅背景
-internal val Slate100         = Color(0xFFF1F5F9)   // 卡片底
-internal val Slate200         = Color(0xFFE2E8F0)   // 浅边
-internal val Slate300         = Color(0xFFCBD5E1)
-internal val Slate500         = Color(0xFF64748B)   // 二级文字
-internal val Slate700         = Color(0xFF334155)   // 主文字
-internal val Slate900         = Color(0xFF0F172A)   // 高对比
+// ── 中性色原始 palette（只在构建 ColorScheme 时使用；UI 请用下方语义 token）──
+private val Slate50            = Color(0xFFF8FAFC)   // 极浅背景
+internal val Slate100          = Color(0xFFF1F5F9)   // 卡片底
+private val Slate200           = Color(0xFFE2E8F0)   // 浅边
+internal val Slate300          = Color(0xFFCBD5E1)
+internal val Slate500          = Color(0xFF64748B)   // 二级文字
+internal val Slate700          = Color(0xFF334155)   // 主文字
+internal val Slate900          = Color(0xFF0F172A)   // 高对比
 
 // 保留金色作为次要 accent（"Done" 状态、成功提示用）
-internal val GoldPyramid      = Color(0xFFB8860B)
+internal val GoldPyramid       = Color(0xFFB8860B)
 internal val GoldPyramidBright = Color(0xFFD4A847)
-internal val GoldPyramidDeep  = Color(0xFF8B6508)
+internal val GoldPyramidDeep   = Color(0xFF8B6508)
 
-// 语义色
-internal val MintAccent       = Color(0xFF22C55E)   // Done / success
-internal val MintAccentSoft   = Color(0xFF86EFAC)
-internal val CrimsonWarn      = Color(0xFFDC2626)   // Failed / danger
-internal val CrimsonWarnSoft  = Color(0xFFFCA5A5)
-internal val CyanInfo         = Color(0xFF0EA5E9)   // info
-internal val AmberNotice      = Color(0xFFF59E0B)   // warning
+// 语义色（深浅色通用）
+internal val MintAccent        = Color(0xFF22C55E)   // Done / success
+internal val MintAccentSoft    = Color(0xFF86EFAC)
+internal val CrimsonWarn       = Color(0xFFDC2626)   // Failed / danger
+internal val CrimsonWarnSoft   = Color(0xFFFCA5A5)
+internal val CyanInfo          = Color(0xFF0EA5E9)   // info
+internal val AmberNotice       = Color(0xFFF59E0B)   // warning
 
-// ── 文字 (light theme 配色) ──
-internal val OnSurfaceHigh    = Slate900
-internal val OnSurfaceMid     = Slate700
-internal val OnSurfaceLow     = Slate500
+// ── 语义文字/玻璃 token：跟随当前 ColorScheme（v2.1 起支持深色）──
+// 旧实现是固定浅色常量（Slate900/700/500），深色主题下会变成深字深底不可读。
+// 这里改成 @Composable getter：浅色 = 原来的效果，深色自动用 dark scheme 的 onSurface。
+internal val OnSurfaceHigh: Color
+    @Composable @ReadOnlyComposable
+    get() = MaterialTheme.colorScheme.onSurface
 
-// ── Glass / Frosted (Compose 1.7+ blur via RenderEffect, minSdk 31+) ──
-// Light theme：白半透 + 浅边；Dark theme：dark 半透。
-// v1.2 调色：GlassOutline 边从 alpha 0.8 降到 0.5（更柔和，避免颜色"怪"）。
-internal val GlassSurface     = Color(0xFFFFFFFF).copy(alpha = 0.72f)
-internal val GlassSurfaceHigh = Color(0xFFFFFFFF).copy(alpha = 0.85f)
-internal val GlassOutline     = Slate200.copy(alpha = 0.5f)
-internal val GlassHighlight   = Color(0xFFFFFFFF).copy(alpha = 0.5f)
+internal val OnSurfaceMid: Color
+    @Composable @ReadOnlyComposable
+    get() = MaterialTheme.colorScheme.onSurfaceVariant
+
+internal val OnSurfaceLow: Color
+    @Composable @ReadOnlyComposable
+    get() = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.72f)
+
+// ── Glass / Frosted token（浅色白半透 / 深色暗半透，靠 surface + alpha 表达）──
+internal val GlassSurface: Color
+    @Composable @ReadOnlyComposable
+    get() = MaterialTheme.colorScheme.surface.copy(alpha = 0.72f)
+
+internal val GlassSurfaceHigh: Color
+    @Composable @ReadOnlyComposable
+    get() = MaterialTheme.colorScheme.surface.copy(alpha = 0.85f)
+
+internal val GlassOutline: Color
+    @Composable @ReadOnlyComposable
+    get() = MaterialTheme.colorScheme.outline.copy(alpha = 0.6f)
+
+internal val GlassHighlight: Color = Color.White.copy(alpha = 0.35f)
 
 private val LightScheme = lightColorScheme(
     primary            = BlueAccent,
@@ -72,9 +86,9 @@ private val LightScheme = lightColorScheme(
     errorContainer     = CrimsonWarnSoft,
     onErrorContainer   = Color(0xFF7F1D1D),
     surface            = Color.White,
-    onSurface          = OnSurfaceHigh,
+    onSurface          = Slate900,
     surfaceVariant     = Slate100,
-    onSurfaceVariant   = OnSurfaceMid,
+    onSurfaceVariant   = Slate700,
     surfaceContainer   = Slate50,
     surfaceContainerHigh = Color.White,
     surfaceContainerLowest = Color.White,
@@ -82,7 +96,7 @@ private val LightScheme = lightColorScheme(
     outline            = Slate200,
     outlineVariant     = Slate200.copy(alpha = 0.5f),
     background         = Color(0xFFFAFBFC),
-    onBackground       = OnSurfaceHigh,
+    onBackground       = Slate900,
 )
 
 private val DarkScheme = darkColorScheme(
@@ -156,19 +170,21 @@ data class TwoFATokens(
 
 val LocalTwoFATokens = staticCompositionLocalOf { TwoFATokens() }
 
+/**
+ * 应用主题。
+ *
+ * v2.1（桌面同步）：由 [com.twopyramid.twofa.settings.ThemeMode] 驱动（light/dark/system），
+ * 由 `MainActivity` 从 [com.twopyramid.twofa.settings.SettingsRepository] 读取后传入。
+ *
+ * **关闭 dynamic color（Material You）**：Android 12+ 的系统取色会让品牌蓝随壁纸漂移，
+ * 与桌面「固定 #007BFF」的品牌口径冲突；这里统一用品牌 Light/DarkScheme（报告 §4.3 E3）。
+ */
 @Composable
 fun TwoFATheme(
-    darkTheme: Boolean = false,  // 默认 light 主题（PC 端对齐）
+    darkTheme: Boolean = isSystemInDarkTheme(),
     content: @Composable () -> Unit,
 ) {
-    val context = LocalContext.current
-    val scheme = when {
-        // Android 12+ 用系统动态色（Material You），但允许用户后续覆盖
-        Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && darkTheme -> dynamicDarkColorScheme(context)
-        Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && !darkTheme -> dynamicLightColorScheme(context)
-        darkTheme -> DarkScheme
-        else      -> LightScheme
-    }
+    val scheme = if (darkTheme) DarkScheme else LightScheme
 
     CompositionLocalProvider(
         LocalTwoFATokens provides TwoFATokens(),

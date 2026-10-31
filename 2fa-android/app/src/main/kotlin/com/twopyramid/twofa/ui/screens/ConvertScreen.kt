@@ -1,11 +1,13 @@
 package com.twopyramid.twofa.ui.screens
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
@@ -13,8 +15,7 @@ import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -30,8 +31,10 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowBack
@@ -40,13 +43,16 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.FolderZip
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -59,33 +65,47 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.twopyramid.twofa.queue.ItemProgress
+import com.twopyramid.twofa.queue.ProgressRepository
 import com.twopyramid.twofa.queue.QueueItem
 import com.twopyramid.twofa.queue.QueueRepository
 import com.twopyramid.twofa.service.ZipQueueService
 import com.twopyramid.twofa.settings.AppSettings
+import com.twopyramid.twofa.settings.ConvertOptions
+import com.twopyramid.twofa.settings.NamingPreset
+import com.twopyramid.twofa.settings.SettingsRepository
+import com.twopyramid.twofa.ui.Texts
 import com.twopyramid.twofa.ui.components.GlassCard
 import com.twopyramid.twofa.ui.components.PrimaryActionButton
 import com.twopyramid.twofa.ui.components.SecondaryActionButton
+import com.twopyramid.twofa.ui.theme.AmberNotice
 import com.twopyramid.twofa.ui.theme.BlueAccent
+import com.twopyramid.twofa.ui.theme.CrimsonWarn
 import com.twopyramid.twofa.ui.theme.LocalTwoFATokens
 import com.twopyramid.twofa.ui.theme.OnSurfaceHigh
 import com.twopyramid.twofa.ui.theme.OnSurfaceLow
-import com.twopyramid.twofa.ui.theme.Slate100
 import com.twopyramid.twofa.ui.viewmodel.HomeViewModel
+import java.util.Locale
 
 /**
- * ConvertScreen：队列 + 添加 Zip + ItemDetail + 选 target version dialog。
+ * ConvertScreen：队列 + 添加 Zip + ItemDetail + 「选择目标版本与转换选项」对话框。
  *
- * v1.3 改造：
- *   - 删右下 FAB，"添加 Zip" 入口挪到 TopBar 右侧 "+" 图标
- *   - 空状态从"两行字 + FAB"重做为"hero card + 主操作按钮"
- *   - 队列非空时只显示列表 + TopBar 角标，不挡内容
+ * v2.1（桌面 2.203.0 同步，L4/L5）：
+ *  - 版本表 27 项（新增 26.3/97），状态徽章对齐桌面；
+ *  - 目标版本对话框内嵌**转换选项区**（6 个用户可见开关 + 命名模板预设），
+ *    危险项红色「会删文件」标记 + 二次确认；26.3/Bedrock 选择即非阻塞警示；
+ *  - 真实进度链路：ProgressRepository（Service 只写 / UI 只收集），不再用本地假动画；
+ *  - 入队后自动启动前台服务（旧版只有"重新转换"路径启动，S24）；
+ *  - Android 13+ POST_NOTIFICATIONS 运行时权限（不阻塞转换）。
  *
- * 拆自 HomeScreen v1（让 Home 变介绍页 + 入口）。
+ * `fix_alpha_layers` 是桌面 M3 后的死开关，**不在 UI 暴露**（字段保留在 ConvertOptions）。
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -93,11 +113,37 @@ fun ConvertScreen(onBack: () -> Unit) {
     val ctx = LocalContext.current
     val viewModel: HomeViewModel = viewModel()
     val items by viewModel.queue.collectAsState()
+    val progressMap by ProgressRepository.items.collectAsState()
     val tokens = LocalTwoFATokens.current
+    val lastTargetVersion by SettingsRepository.lastTargetVersion.collectAsState()
 
     var pendingUri by remember { mutableStateOf<Uri?>(null) }
-    var targetVersion by remember { mutableStateOf(AppSettings.defaultTargetVersion) }
+    var targetVersion by remember { mutableStateOf(lastTargetVersion) }
     var detailItem by remember { mutableStateOf<QueueItem?>(null) }
+
+    // ── 前台服务启动（Android 12+ 后台启动限制；Android 13+ 通知权限）──
+    val startQueueService: () -> Unit = {
+        ContextCompat.startForegroundService(ctx, Intent(ctx, ZipQueueService::class.java))
+    }
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission(),
+    ) { _ ->
+        // 无论是否授权都继续（未授权只是看不到前台通知，转换本身不受影响）
+        startQueueService()
+    }
+    val startQueueWithPermission: () -> Unit = {
+        val needPermission =
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                ContextCompat.checkSelfPermission(
+                    ctx,
+                    Manifest.permission.POST_NOTIFICATIONS,
+                ) != PackageManager.PERMISSION_GRANTED
+        if (needPermission) {
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        } else {
+            startQueueService()
+        }
+    }
 
     val pickZipLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
@@ -131,6 +177,7 @@ fun ConvertScreen(onBack: () -> Unit) {
                 ConvertList(
                     items = items,
                     tokens = tokens,
+                    progress = progressMap,
                     onItemClick = { detailItem = it },
                 )
             }
@@ -142,10 +189,13 @@ fun ConvertScreen(onBack: () -> Unit) {
             fileName = pendingUri?.lastPathSegment ?: "pack.zip",
             currentVersion = targetVersion,
             versions = AppSettings.versions,
-            // (v1.2.2 ConvertVersionDialog 改用 VersionEntry，不需要 versionLabel 传参)
             onDismiss = { pendingUri = null },
-            onConfirm = { chosen ->
-                pendingUri?.let { viewModel.addFromSaf(it, chosen) }
+            onConfirm = {
+                pendingUri?.let { uri ->
+                    viewModel.addFromSaf(uri, targetVersion)
+                    SettingsRepository.setLastTargetVersion(targetVersion)
+                    startQueueWithPermission()
+                }
                 pendingUri = null
             },
             onVersionChange = { targetVersion = it },
@@ -163,6 +213,7 @@ fun ConvertScreen(onBack: () -> Unit) {
             if (current != null) {
                 ConvertDetailSheet(
                     item = current,
+                    progress = progressMap[current.id],
                     onRemove = {
                         QueueRepository.remove(current.id)
                         detailItem = null
@@ -170,7 +221,7 @@ fun ConvertScreen(onBack: () -> Unit) {
                     onRetry = {
                         QueueRepository.updateStatus(current.id, QueueItem.Status.Queued)
                         detailItem = null
-                        ctx.startService(Intent(ctx, ZipQueueService::class.java))
+                        startQueueWithPermission()
                     },
                 )
             }
@@ -232,7 +283,6 @@ private fun ConvertEmpty(modifier: Modifier = Modifier, onAdd: () -> Unit) {
         enter = fadeIn() + scaleIn(initialScale = 0.96f),
         modifier = modifier.fillMaxSize(),
     ) {
-        // v1.3: hero card 空状态 — 大图标 + 主操作按钮 + 副 hint
         Column(
             modifier = Modifier
                 .fillMaxSize()
@@ -252,7 +302,6 @@ private fun ConvertEmpty(modifier: Modifier = Modifier, onAdd: () -> Unit) {
                         .padding(horizontal = 24.dp, vertical = 32.dp),
                     horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
-                    // 圆形 backdrop + 大图标
                     Box(
                         modifier = Modifier
                             .size(72.dp)
@@ -281,7 +330,6 @@ private fun ConvertEmpty(modifier: Modifier = Modifier, onAdd: () -> Unit) {
                         color = OnSurfaceLow,
                     )
                     Spacer(Modifier.height(24.dp))
-                    // 主操作按钮 — 满宽,跟 v1.2 的 PrimaryActionButton 风格一致
                     PrimaryActionButton(
                         text = "选择 Zip 文件",
                         onClick = onAdd,
@@ -289,9 +337,8 @@ private fun ConvertEmpty(modifier: Modifier = Modifier, onAdd: () -> Unit) {
                 }
             }
             Spacer(Modifier.height(20.dp))
-            // 副 hint:从历史/批量入口预留(后续版本加)
             Text(
-                "提示:选完文件后会让你挑目标版本",
+                "提示：选完文件后可以挑目标版本和转换选项",
                 style = MaterialTheme.typography.bodySmall,
                 color = OnSurfaceLow,
             )
@@ -303,6 +350,7 @@ private fun ConvertEmpty(modifier: Modifier = Modifier, onAdd: () -> Unit) {
 private fun ConvertList(
     items: List<QueueItem>,
     tokens: com.twopyramid.twofa.ui.theme.TwoFATokens,
+    progress: Map<String, ItemProgress>,
     onItemClick: (QueueItem) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -318,6 +366,7 @@ private fun ConvertList(
                 item = item,
                 index = items.indexOf(item),
                 tokens = tokens,
+                progress = progress[item.id],
                 onClick = { onItemClick(item) },
             )
         }
@@ -329,6 +378,7 @@ private fun ConvertRow(
     item: QueueItem,
     index: Int,
     tokens: com.twopyramid.twofa.ui.theme.TwoFATokens,
+    progress: ItemProgress?,
     onClick: () -> Unit,
 ) {
     val visibleState = remember { androidx.compose.animation.core.MutableTransitionState(false) }
@@ -352,12 +402,12 @@ private fun ConvertRow(
         ),
         exit = fadeOut() + slideOutVertically(targetOffsetY = { it / 4 }),
     ) {
-        ConvertRowCard(item = item, onClick = onClick)
+        ConvertRowCard(item = item, progress = progress, onClick = onClick)
     }
 }
 
 @Composable
-private fun ConvertRowCard(item: QueueItem, onClick: () -> Unit) {
+private fun ConvertRowCard(item: QueueItem, progress: ItemProgress?, onClick: () -> Unit) {
     val accent: Color = when (item.status) {
         is QueueItem.Status.Done    -> Color(0xFF22C55E)
         is QueueItem.Status.Failed  -> MaterialTheme.colorScheme.error
@@ -421,19 +471,21 @@ private fun ConvertRowCard(item: QueueItem, onClick: () -> Unit) {
                 }
                 if (item.status is QueueItem.Status.Running) {
                     Spacer(Modifier.height(8.dp))
-                    val animProgress by animateFloatAsState(
-                        targetValue = 0.4f,
-                        animationSpec = androidx.compose.animation.core.tween(1200),
-                        label = "indeterminate",
-                    )
+                    val percent = progress?.percent ?: 0f
                     LinearProgressIndicator(
-                        progress = { animProgress },
+                        progress = { percent },
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(3.dp)
                             .clip(RoundedCornerShape(2.dp)),
                         color = BlueAccent,
-                        trackColor = Slate100,
+                        trackColor = MaterialTheme.colorScheme.surfaceVariant,
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        Texts.progressLine(progress?.phase, percent),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = OnSurfaceLow,
                     )
                 }
             }
@@ -451,16 +503,23 @@ private fun ConvertRowCard(item: QueueItem, onClick: () -> Unit) {
     }
 }
 
+/** 危险开关（需要红色标记 + 二次确认的项）。 */
+private enum class DangerKind { DELETE_SHADERS, DELETE_CIT }
+
 @Composable
 private fun ConvertVersionDialog(
     fileName: String,
     currentVersion: Int,
-    versions: List<com.twopyramid.twofa.settings.AppSettings.VersionEntry>,
+    versions: List<AppSettings.VersionEntry>,
     onDismiss: () -> Unit,
-    onConfirm: (Int) -> Unit,
+    onConfirm: () -> Unit,
     onVersionChange: (Int) -> Unit,
 ) {
     var query by remember { mutableStateOf("") }
+    val options by SettingsRepository.convertOptions.collectAsState()
+    val namingPreset by SettingsRepository.namingPreset.collectAsState()
+    var pendingDanger by remember { mutableStateOf<DangerKind?>(null) }
+
     val filtered = remember(query, versions) {
         if (query.isBlank()) versions
         else versions.filter {
@@ -472,18 +531,23 @@ private fun ConvertVersionDialog(
     }
 
     // 按 era 分组
-    val grouped: List<Pair<com.twopyramid.twofa.settings.AppSettings.VersionEra, List<com.twopyramid.twofa.settings.AppSettings.VersionEntry>>> =
+    val grouped: List<Pair<AppSettings.VersionEra, List<AppSettings.VersionEntry>>> =
         remember(filtered) {
-            com.twopyramid.twofa.settings.AppSettings.VersionEra.entries
+            AppSettings.VersionEra.entries
                 .map { era -> era to filtered.filter { it.era == era } }
                 .filter { it.second.isNotEmpty() }
         }
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("选择目标版本") },
+        title = { Text("选择目标版本与选项") },
         text = {
-            Column {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 520.dp)
+                    .verticalScroll(rememberScrollState()),
+            ) {
                 Text(
                     fileName,
                     style = MaterialTheme.typography.bodyMedium,
@@ -535,131 +599,419 @@ private fun ConvertVersionDialog(
                     }
                 }
                 Spacer(Modifier.height(12.dp))
-                // era 分组 + cards 列表
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(max = 420.dp)
-                        .verticalScroll(rememberScrollState()),
-                ) {
-                    if (grouped.isEmpty()) {
-                        Text(
-                            "没找到匹配 \"$query\"",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = OnSurfaceLow,
-                            modifier = Modifier.padding(16.dp),
-                        )
-                    } else {
-                        grouped.forEach { (era, items) ->
-                            // era 标题
+
+                // era 分组 + version cards
+                if (grouped.isEmpty()) {
+                    Text(
+                        "没找到匹配 \"$query\"",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = OnSurfaceLow,
+                        modifier = Modifier.padding(16.dp),
+                    )
+                } else {
+                    grouped.forEach { (era, items) ->
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 4.dp, vertical = 6.dp),
+                        ) {
+                            Text(
+                                era.label,
+                                style = MaterialTheme.typography.labelLarge,
+                                color = BlueAccent,
+                                fontWeight = FontWeight.Bold,
+                            )
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                "· ${era.desc}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = OnSurfaceLow,
+                            )
+                            Spacer(Modifier.weight(1f))
+                            Text(
+                                "${items.size}",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = OnSurfaceLow,
+                            )
+                        }
+                        Spacer(Modifier.height(6.dp))
+                        items.forEach { v ->
+                            val isSelected = v.packFormat == currentVersion
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .padding(horizontal = 4.dp, vertical = 6.dp),
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(
+                                        if (isSelected) BlueAccent.copy(alpha = 0.12f)
+                                        else OnSurfaceLow.copy(alpha = 0.04f)
+                                    )
+                                    .clickable { onVersionChange(v.packFormat) }
+                                    .padding(horizontal = 12.dp, vertical = 10.dp),
                             ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text(
+                                            v.label,
+                                            style = MaterialTheme.typography.titleMedium,
+                                            color = if (isSelected) BlueAccent else OnSurfaceHigh,
+                                            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.SemiBold,
+                                        )
+                                        v.status?.let { s ->
+                                            Spacer(Modifier.width(6.dp))
+                                            StatusBadge(s)
+                                        }
+                                    }
+                                    Text(
+                                        v.range,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = OnSurfaceLow,
+                                    )
+                                }
+                                Spacer(Modifier.width(8.dp))
                                 Text(
-                                    era.label,
-                                    style = MaterialTheme.typography.labelLarge,
-                                    color = BlueAccent,
-                                    fontWeight = FontWeight.Bold,
-                                )
-                                Spacer(Modifier.width(6.dp))
-                                Text(
-                                    "· ${era.desc}",
+                                    "pack_format ${v.packFormat}",
                                     style = MaterialTheme.typography.bodySmall,
-                                    color = OnSurfaceLow,
+                                    color = if (isSelected) BlueAccent else OnSurfaceLow,
+                                    fontWeight = FontWeight.Medium,
                                 )
-                                Spacer(Modifier.weight(1f))
-                                Text(
-                                    "${items.size}",
-                                    style = MaterialTheme.typography.labelLarge,
-                                    color = OnSurfaceLow,
-                                )
+                                if (isSelected) {
+                                    Spacer(Modifier.width(8.dp))
+                                    Icon(
+                                        Icons.Filled.Check,
+                                        contentDescription = null,
+                                        tint = BlueAccent,
+                                        modifier = Modifier.size(18.dp),
+                                    )
+                                }
                             }
                             Spacer(Modifier.height(6.dp))
-                            // 该 era 的 version cards
-                            items.forEach { v ->
-                                val isSelected = v.packFormat == currentVersion
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .clip(RoundedCornerShape(12.dp))
-                                        .background(
-                                            if (isSelected) BlueAccent.copy(alpha = 0.12f)
-                                            else OnSurfaceLow.copy(alpha = 0.04f)
-                                        )
-                                        .clickable { onVersionChange(v.packFormat) }
-                                        .padding(horizontal = 12.dp, vertical = 10.dp),
-                                ) {
-                                    Column(modifier = Modifier.weight(1f)) {
-                                        Row(verticalAlignment = Alignment.CenterVertically) {
-                                            Text(
-                                                v.label,
-                                                style = MaterialTheme.typography.titleMedium,
-                                                color = if (isSelected) BlueAccent else OnSurfaceHigh,
-                                                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.SemiBold,
-                                            )
-                                            // status badge
-                                            v.status?.let { s ->
-                                                Spacer(Modifier.width(6.dp))
-                                                StatusBadge(s)
-                                            }
-                                        }
-                                        Text(
-                                            v.range,
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = OnSurfaceLow,
-                                        )
-                                    }
-                                    Spacer(Modifier.width(8.dp))
-                                    Text(
-                                        "pack_format ${v.packFormat}",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = if (isSelected) BlueAccent else OnSurfaceLow,
-                                        fontWeight = FontWeight.Medium,
-                                    )
-                                    if (isSelected) {
-                                        Spacer(Modifier.width(8.dp))
-                                        Icon(
-                                            Icons.Filled.Check,
-                                            contentDescription = null,
-                                            tint = BlueAccent,
-                                            modifier = Modifier.size(18.dp),
-                                        )
-                                    }
-                                }
-                                Spacer(Modifier.height(6.dp))
-                            }
-                            Spacer(Modifier.height(4.dp))
                         }
+                        Spacer(Modifier.height(4.dp))
                     }
                 }
+
+                // ── 选择即警示（非阻塞，S2）──
+                if (AppSettings.hasKnownIssue(currentVersion)) {
+                    WarningCard(
+                        title = Texts.java263WarnTitle,
+                        body = Texts.java263WarnBody,
+                        accent = AmberNotice,
+                    )
+                }
+                if (AppSettings.isBedrock(currentVersion)) {
+                    WarningCard(
+                        title = Texts.bedrockWarnTitle,
+                        body = Texts.bedrockWarnBody,
+                        accent = AmberNotice,
+                    )
+                }
+
+                Spacer(Modifier.height(8.dp))
+                HorizontalDivider(color = OnSurfaceLow.copy(alpha = 0.15f))
+                Spacer(Modifier.height(8.dp))
+
+                // ── 转换选项区（7 个开关中 fix_alpha_layers 不暴露）──
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        Texts.optionsTitle,
+                        style = MaterialTheme.typography.titleMedium,
+                        color = OnSurfaceHigh,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Spacer(Modifier.weight(1f))
+                    TextButton(onClick = { SettingsRepository.resetConversionOptions() }) {
+                        Text(Texts.optionsReset, color = BlueAccent, style = MaterialTheme.typography.labelLarge)
+                    }
+                }
+                Text(
+                    Texts.optionsHint,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = OnSurfaceLow,
+                )
+                Spacer(Modifier.height(4.dp))
+
+                ConversionOptionsSection(
+                    options = options,
+                    namingPreset = namingPreset,
+                    onDangerRequest = { kind -> pendingDanger = kind },
+                )
             }
         },
         confirmButton = {
-            TextButton(onClick = { onConfirm(currentVersion) }) {
-                Text("开始转换", color = BlueAccent, fontWeight = FontWeight.SemiBold)
+            TextButton(onClick = onConfirm) {
+                Text(Texts.startConvert, color = BlueAccent, fontWeight = FontWeight.SemiBold)
             }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) { Text("取消") }
+            TextButton(onClick = onDismiss) { Text(Texts.cancel) }
         },
+        containerColor = MaterialTheme.colorScheme.surface,
+    )
+
+    // 危险开关的二次确认
+    pendingDanger?.let { kind ->
+        DangerConfirmDialog(
+            kind = kind,
+            onConfirm = {
+                when (kind) {
+                    DangerKind.DELETE_SHADERS -> SettingsRepository.setDeleteShaders(true)
+                    DangerKind.DELETE_CIT -> SettingsRepository.setDeleteCit(true)
+                }
+                pendingDanger = null
+            },
+            onDismiss = { pendingDanger = null },
+        )
+    }
+}
+
+/** 转换选项列表（转换对话框内使用；设置页显示摘要，不重复渲染）。 */
+@Composable
+private fun ConversionOptionsSection(
+    options: ConvertOptions,
+    namingPreset: NamingPreset,
+    onDangerRequest: (DangerKind) -> Unit,
+) {
+    // adapt_shaders：默认 true，实验功能
+    ConversionSwitchRow(
+        label = Texts.adaptShadersLabel,
+        hint = Texts.adaptShadersHint,
+        checked = options.adaptShaders,
+        onCheckedChange = { SettingsRepository.setAdaptShaders(it) },
+    )
+    // delete_shaders：破坏性，默认 false，红色标记 + 二次确认
+    ConversionSwitchRow(
+        label = Texts.deleteShadersLabel,
+        hint = Texts.deleteShadersHint,
+        checked = options.deleteShaders,
+        destructive = true,
+        onCheckedChange = { enabled ->
+            if (enabled) onDangerRequest(DangerKind.DELETE_SHADERS)
+            else SettingsRepository.setDeleteShaders(false)
+        },
+    )
+    // convert_item_definitions：默认 true
+    ConversionSwitchRow(
+        label = Texts.convertItemDefinitionsLabel,
+        hint = Texts.convertItemDefinitionsHint,
+        checked = options.convertItemDefinitions,
+        onCheckedChange = { SettingsRepository.setConvertItemDefinitions(it) },
+    )
+    // convert_cit：默认 false（止血）；delete_cit 开启时禁用（删除优先）
+    ConversionSwitchRow(
+        label = Texts.convertCitLabel,
+        hint = if (options.deleteCit) Texts.deleteCitOverridesConvertCit else Texts.convertCitHint,
+        checked = options.convertCit,
+        enabled = !options.deleteCit,
+        onCheckedChange = { SettingsRepository.setConvertCit(it) },
+    )
+    // delete_cit：破坏性，默认 false，优先级高于 convert_cit
+    ConversionSwitchRow(
+        label = Texts.deleteCitLabel,
+        hint = Texts.deleteCitHint,
+        checked = options.deleteCit,
+        destructive = true,
+        onCheckedChange = { enabled ->
+            if (enabled) onDangerRequest(DangerKind.DELETE_CIT)
+            else SettingsRepository.setDeleteCit(false)
+        },
+    )
+    // write_gen_metadata：默认 true（仅 Java 目标写 2pyr-gen.json）
+    ConversionSwitchRow(
+        label = Texts.genMetadataLabel,
+        hint = Texts.genMetadataHint,
+        checked = options.writeGenMetadata,
+        onCheckedChange = { SettingsRepository.setWriteGenMetadata(it) },
+    )
+
+    Spacer(Modifier.height(10.dp))
+    // 命名模板预设
+    Text(
+        Texts.namingTitle,
+        style = MaterialTheme.typography.titleMedium,
+        color = OnSurfaceHigh,
+        fontWeight = FontWeight.SemiBold,
+    )
+    Text(
+        Texts.namingHint,
+        style = MaterialTheme.typography.bodySmall,
+        color = OnSurfaceLow,
+    )
+    Spacer(Modifier.height(6.dp))
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .horizontalScroll(rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        NamingPreset.entries.forEach { preset ->
+            val active = preset == namingPreset
+            Box(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(999.dp))
+                    .background(
+                        if (active) BlueAccent.copy(alpha = 0.14f)
+                        else OnSurfaceLow.copy(alpha = 0.06f)
+                    )
+                    .clickable { SettingsRepository.setNamingPreset(preset) }
+                    .padding(horizontal = 12.dp, vertical = 6.dp),
+            ) {
+                Text(
+                    preset.label,
+                    style = MaterialTheme.typography.labelLarge,
+                    color = if (active) BlueAccent else OnSurfaceLow,
+                    fontWeight = if (active) FontWeight.SemiBold else FontWeight.Medium,
+                )
+            }
+        }
+    }
+    Spacer(Modifier.height(4.dp))
+    Text(
+        namingPreset.desc,
+        style = MaterialTheme.typography.bodySmall,
+        color = OnSurfaceLow,
+    )
+}
+
+@Composable
+private fun ConversionSwitchRow(
+    label: String,
+    hint: String,
+    checked: Boolean,
+    destructive: Boolean = false,
+    enabled: Boolean = true,
+    onCheckedChange: (Boolean) -> Unit,
+) {
+    Column(modifier = Modifier.fillMaxWidth().padding(vertical = 5.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(modifier = Modifier.weight(1f)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        label,
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = OnSurfaceHigh,
+                        fontWeight = FontWeight.Medium,
+                    )
+                    if (destructive) {
+                        Spacer(Modifier.width(6.dp))
+                        DangerTag()
+                    }
+                }
+                Text(
+                    hint,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = OnSurfaceLow,
+                )
+            }
+            Spacer(Modifier.width(8.dp))
+            Switch(
+                checked = checked,
+                enabled = enabled,
+                onCheckedChange = onCheckedChange,
+                colors = if (destructive) {
+                    SwitchDefaults.colors(checkedTrackColor = CrimsonWarn)
+                } else {
+                    SwitchDefaults.colors()
+                },
+            )
+        }
+    }
+}
+
+@Composable
+private fun DangerTag() {
+    Box(
+        modifier = Modifier
+            .clip(RoundedCornerShape(6.dp))
+            .background(CrimsonWarn.copy(alpha = 0.14f))
+            .padding(horizontal = 6.dp, vertical = 1.dp),
+    ) {
+        Text(
+            Texts.dangerTag,
+            style = MaterialTheme.typography.labelSmall,
+            color = CrimsonWarn,
+            fontWeight = FontWeight.SemiBold,
+        )
+    }
+}
+
+@Composable
+private fun WarningCard(title: String, body: String, accent: Color) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 8.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .background(accent.copy(alpha = 0.10f))
+            .padding(horizontal = 12.dp, vertical = 10.dp),
+    ) {
+        Icon(
+            Icons.Filled.Warning,
+            contentDescription = null,
+            tint = accent,
+            modifier = Modifier.size(18.dp),
+        )
+        Spacer(Modifier.width(8.dp))
+        Column {
+            Text(
+                title,
+                style = MaterialTheme.typography.labelLarge,
+                color = accent,
+                fontWeight = FontWeight.Bold,
+            )
+            Spacer(Modifier.height(2.dp))
+            Text(
+                body,
+                style = MaterialTheme.typography.bodySmall,
+                color = OnSurfaceLow,
+            )
+        }
+    }
+}
+
+@Composable
+private fun DangerConfirmDialog(
+    kind: DangerKind,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val title: String
+    val body: String
+    when (kind) {
+        DangerKind.DELETE_SHADERS -> {
+            title = Texts.deleteShadersConfirmTitle
+            body = Texts.deleteShadersConfirmBody
+        }
+        DangerKind.DELETE_CIT -> {
+            title = Texts.deleteCitConfirmTitle
+            body = Texts.deleteCitConfirmBody
+        }
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = { Text(body, color = OnSurfaceLow) },
+        confirmButton = {
+            TextButton(onClick = onConfirm) {
+                Text(Texts.confirmEnable, color = CrimsonWarn, fontWeight = FontWeight.SemiBold)
+            }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text(Texts.cancel) } },
         containerColor = MaterialTheme.colorScheme.surface,
     )
 }
 
 @Composable
-private fun StatusBadge(status: com.twopyramid.twofa.settings.AppSettings.VersionStatus) {
+private fun StatusBadge(status: AppSettings.VersionStatus) {
     val (bg, fg) = when (status) {
-        com.twopyramid.twofa.settings.AppSettings.VersionStatus.STABLE ->
+        AppSettings.VersionStatus.STABLE ->
             Color(0xFF14532D) to Color(0xFFA8FFB0)  // 绿
-        com.twopyramid.twofa.settings.AppSettings.VersionStatus.LATEST ->
+        AppSettings.VersionStatus.LATEST ->
             BlueAccent to Color.White  // 蓝
-        com.twopyramid.twofa.settings.AppSettings.VersionStatus.RECOMMENDED ->
+        AppSettings.VersionStatus.RECOMMENDED ->
             Color(0xFFB45309) to Color(0xFFFEF3C7)  // 琥珀
-        com.twopyramid.twofa.settings.AppSettings.VersionStatus.BETA ->
+        AppSettings.VersionStatus.BETA ->
             Color(0xFF4C1D95) to Color(0xFFE9D5FF)  // 紫
     }
     Box(
@@ -680,14 +1032,17 @@ private fun StatusBadge(status: com.twopyramid.twofa.settings.AppSettings.Versio
 @Composable
 private fun ConvertDetailSheet(
     item: QueueItem,
+    progress: ItemProgress?,
     onRemove: () -> Unit,
     onRetry: () -> Unit,
 ) {
-    val clipboardManager = androidx.compose.ui.platform.LocalClipboardManager.current
+    val clipboardManager = LocalClipboardManager.current
+    var notesExpanded by remember(item.id) { mutableStateOf(false) }
 
     Column(
         modifier = Modifier
             .fillMaxWidth()
+            .verticalScroll(rememberScrollState())
             .padding(horizontal = 24.dp, vertical = 8.dp)
             .padding(bottom = 32.dp),
     ) {
@@ -713,7 +1068,32 @@ private fun ConvertDetailSheet(
 
         when (val s = item.status) {
             is QueueItem.Status.Done -> {
+                // 结果区（4b 真数据；4a 阶段 sourceVersion/skipped/notes 为 DTO 默认值）
+                if (s.sourceVersion > 0) {
+                    SheetInfoLine(
+                        "版本",
+                        "${AppSettings.versionShort(s.sourceVersion)} → " +
+                            AppSettings.versionShort(item.targetVersion),
+                    )
+                    Spacer(Modifier.height(10.dp))
+                }
                 SheetInfoLine("输出路径", s.outputPath)
+                if (s.elapsedMs > 0) {
+                    Spacer(Modifier.height(10.dp))
+                    SheetInfoLine("耗时", formatElapsed(s.elapsedMs))
+                }
+                if (s.skipped > 0) {
+                    Spacer(Modifier.height(10.dp))
+                    SheetInfoLine("跳过的任务数", "${s.skipped}")
+                }
+                if (s.notes.isNotEmpty()) {
+                    Spacer(Modifier.height(12.dp))
+                    NotesSection(
+                        notes = s.notes,
+                        expanded = notesExpanded,
+                        onToggle = { notesExpanded = !notesExpanded },
+                    )
+                }
                 Spacer(Modifier.height(16.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     SecondaryActionButton(text = "移除", onClick = onRemove)
@@ -721,9 +1101,7 @@ private fun ConvertDetailSheet(
                         text = "复制路径",
                         onClick = {
                             runCatching {
-                                clipboardManager.setText(
-                                    androidx.compose.ui.text.AnnotatedString(s.outputPath),
-                                )
+                                clipboardManager.setText(AnnotatedString(s.outputPath))
                             }
                         },
                     )
@@ -738,19 +1116,60 @@ private fun ConvertDetailSheet(
                 }
             }
             is QueueItem.Status.Running -> {
-                Spacer(Modifier.height(8.dp))
+                val percent = progress?.percent ?: 0f
+                Spacer(Modifier.height(4.dp))
                 LinearProgressIndicator(
+                    progress = { percent },
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(4.dp)
                         .clip(RoundedCornerShape(2.dp)),
                     color = BlueAccent,
-                    trackColor = Slate100,
+                    trackColor = MaterialTheme.colorScheme.surfaceVariant,
+                )
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    Texts.progressLine(progress?.phase, percent),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = OnSurfaceLow,
                 )
             }
             is QueueItem.Status.Queued -> {
                 Spacer(Modifier.height(16.dp))
                 PrimaryActionButton(text = "开始转换", onClick = onRetry)
+            }
+        }
+    }
+}
+
+/**
+ * 引擎备注（notes）：**既有跳过原因也有普通进展**（如"写出 12 个物品定义"），
+ * 所以标题用「引擎备注」而不是「跳过原因」（S17 的语义要求）。
+ */
+@Composable
+private fun NotesSection(notes: List<String>, expanded: Boolean, onToggle: () -> Unit) {
+    Column {
+        Text(
+            "引擎备注（含跳过原因与普通进展）",
+            style = MaterialTheme.typography.labelLarge,
+            color = OnSurfaceLow,
+        )
+        Spacer(Modifier.height(4.dp))
+        val visible = if (expanded) notes else notes.take(3)
+        visible.forEach { note ->
+            Text(
+                "· $note",
+                style = MaterialTheme.typography.bodySmall,
+                color = OnSurfaceLow,
+            )
+        }
+        if (notes.size > 3) {
+            TextButton(onClick = onToggle) {
+                Text(
+                    if (expanded) "收起" else "展开全部（${notes.size} 条）",
+                    color = BlueAccent,
+                    style = MaterialTheme.typography.labelLarge,
+                )
             }
         }
     }
@@ -764,3 +1183,6 @@ private fun SheetInfoLine(label: String, value: String) {
         Text(value, style = MaterialTheme.typography.bodyMedium, color = OnSurfaceHigh)
     }
 }
+
+private fun formatElapsed(ms: Long): String =
+    String.format(Locale.US, "%.1fs", ms / 1000.0)

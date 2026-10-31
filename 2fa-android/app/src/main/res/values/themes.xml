@@ -3,6 +3,9 @@
     <style name="Theme.TwoFA" parent="android:Theme.Material.NoActionBar">
         <item name="android:statusBarColor">@color/dark_slate</item>
         <item name="android:navigationBarColor">@color/dark_slate</item>
-        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <!-- 启动窗口底色：与 Compose LightScheme.background 一致，避免浅色主题启动时闪深色。
+             深色 system 下由 values-night 覆盖（见 values-night/themes.xml）。 -->
+        <item name="android:windowBackground">@color/launch_background_light</item>
     </style>
 </resources>

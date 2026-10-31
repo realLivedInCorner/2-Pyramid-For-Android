@@ -4,6 +4,7 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import com.twopyramid.twofa.queue.QueueItem
 import com.twopyramid.twofa.queue.QueueRepository
+import com.twopyramid.twofa.settings.SettingsRepository
 import kotlinx.coroutines.flow.StateFlow
 
 /**
@@ -17,8 +18,10 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
     val queue: StateFlow<List<QueueItem>> = QueueRepository.items
 
     /**
-     * 用户在 HomeScreen 选完 target version 后调用，把 zip 入队。
-     * 每条 item 自带 targetVersion（v1.1 起不再读 AppSettings 全局值）。
+     * 用户在 ConvertScreen 选完 target version 后调用，把 zip 入队。
+     *
+     * v2.1：入队时**冻结**一份 [com.twopyramid.twofa.settings.ConvertOptions] 快照
+     * （7 个开关 + 输出命名 + 目标版本），之后用户改设置不影响已排队任务（S18）。
      */
     fun addFromSaf(uri: android.net.Uri, targetVersion: Int) {
         val ctx = getApplication<Application>().applicationContext
@@ -33,7 +36,7 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
             QueueItem(
                 fileName = fileName,
                 sourceUri = uri,
-                targetVersion = targetVersion,
+                options = SettingsRepository.snapshotOptions(targetVersion),
             )
         )
     }

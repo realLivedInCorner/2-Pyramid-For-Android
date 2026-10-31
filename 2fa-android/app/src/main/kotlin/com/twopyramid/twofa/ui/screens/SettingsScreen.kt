@@ -1,5 +1,6 @@
 package com.twopyramid.twofa.ui.screens
 
+import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
@@ -9,6 +10,7 @@ import androidx.compose.animation.slideInVertically
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -49,6 +51,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -62,47 +65,57 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.documentfile.provider.DocumentFile
+import com.twopyramid.twofa.BuildConfig
 import com.twopyramid.twofa.history.HistoryRepository
 import com.twopyramid.twofa.native.RustNative
-import com.twopyramid.twofa.settings.AppSettings
+import com.twopyramid.twofa.settings.ConvertOptions
+import com.twopyramid.twofa.settings.NamingPreset
+import com.twopyramid.twofa.settings.OutputMode
+import com.twopyramid.twofa.settings.SettingsRepository
+import com.twopyramid.twofa.settings.ThemeMode
 import com.twopyramid.twofa.ui.components.GlassCard
 import com.twopyramid.twofa.ui.theme.BlueAccent
 import com.twopyramid.twofa.ui.theme.CrimsonWarn
-import com.twopyramid.twofa.ui.theme.GlassOutline
-import com.twopyramid.twofa.ui.theme.GlassSurface
 import com.twopyramid.twofa.ui.theme.LocalTwoFATokens
 import com.twopyramid.twofa.ui.theme.OnSurfaceHigh
 import com.twopyramid.twofa.ui.theme.OnSurfaceLow
 import java.io.File
 
 /**
- * 设置页（v1.2.1 改：加 CONVERT / DATA / DEV / About dialog）。
+ * 设置页。
  *
- * 视觉：back + page title + 搜索框 + 分组（玻璃卡 group-card）。
- * 组：
- *   - CONVERT：输出模式（跟随 / 固定）+ 固定路径选择
- *   - DATA：清空历史 / 清空缓存
- *   - DEVELOPER：开发者模式 switch
- *   - ANIMATION：动画速率 segmented
- *   - DEV (dev mode 启用时显示)：查看日志
- *   - ABOUT：2-Pyramid For Android 介绍 + 点击 version 弹 dialog
+ * v2.1（桌面 2.203.0 同步）：
+ *  - 全部设置持久化（SharedPreferences → [SettingsRepository]），重启保持；
+ *  - **主题三档** light / dark / system（比桌面现状完整，报告 E3），切换即时生效；
+ *  - CONVERT 分组：输出模式/固定路径 + 命名模板预设 + 转换选项摘要（详细开关在转换对话框内调整）；
+ *  - SAF 固定输出目录修复（S19）：存原始 `content://` tree URI，Service 据此判断分支；
+ *  - ABOUT：App versionName（BuildConfig）+ convertCoreVersion 两行，移除旧写死更新文案。
  */
 @Composable
 fun SettingsScreen(onBack: () -> Unit) {
     val tokens = LocalTwoFATokens.current
     val ctx = LocalContext.current
-    var devMode by remember { mutableStateOf(AppSettings.isDevMode()) }
+
+    val themeMode by SettingsRepository.themeMode.collectAsState()
+    val devMode by SettingsRepository.devMode.collectAsState()
+    val outputMode by SettingsRepository.outputMode.collectAsState()
+    val outputPath by SettingsRepository.outputPath.collectAsState()
+    val namingPreset by SettingsRepository.namingPreset.collectAsState()
+    val convertOptions by SettingsRepository.convertOptions.collectAsState()
+
     var animationSpeed by remember { mutableStateOf<AnimationSpeed>(AnimationSpeed.NORMAL) }
     var searchQuery by remember { mutableStateOf("") }
-    var outputMode by remember { mutableStateOf(AppSettings.outputMode()) }
-    var outputPath by remember { mutableStateOf(AppSettings.outputPath()) }
 
     var showVersionDialog by remember { mutableStateOf(false) }
     var showClearHistoryConfirm by remember { mutableStateOf(false) }
     var showClearCacheConfirm by remember { mutableStateOf(false) }
     var showLogDialog by remember { mutableStateOf(false) }
 
-    val version = remember { runCatching { RustNative.convertCoreVersion() }.getOrNull() ?: "0.0.0" }
+    val appVersion = remember { BuildConfig.VERSION_NAME }
+    val coreVersion = remember {
+        runCatching { RustNative.convertCoreVersion() }.getOrDefault("(unavailable)")
+    }
 
     val pickOutputDir = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocumentTree()
@@ -115,9 +128,9 @@ fun SettingsScreen(onBack: () -> Unit) {
                         android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
                 )
             }
-            val path = uri.path?.removePrefix("/tree/")?.replace("/", File.separator) ?: uri.toString()
-            AppSettings.setOutputPath(path)
-            outputPath = path
+            // S19 修复：保存原始 content:// tree URI（旧实现存 "tree/primary:..." 伪路径，
+            // 导致 ZipQueueService 的 startsWith("content://") 判断永远走不到 SAF 分支）。
+            SettingsRepository.setOutputPath(uri.toString())
         }
     }
 
@@ -135,34 +148,54 @@ fun SettingsScreen(onBack: () -> Unit) {
                 Spacer(Modifier.height(8.dp))
             }
 
-            // ── CONVERT ──
+            // ── THEME（三档，持久化；首帧前由 MainActivity 读取）──
             item {
-                SettingsGroup(title = "CONVERT") {
+                SettingsGroup(title = "THEME") {
                     StaggerItem(0, tokens) {
                         SettingItem(
-                            icon = Icons.Default.Folder,
-                            label = "输出模式",
-                            desc = when (outputMode) {
-                                AppSettings.OutputMode.FOLLOW -> "跟随 zip 同目录"
-                                AppSettings.OutputMode.FIXED  -> "输出到指定目录"
-                            },
+                            icon = Icons.Default.AutoAwesome,
+                            label = "主题",
+                            desc = "浅色 / 深色 / 跟随系统（默认跟随系统）",
                             trailing = {
-                                SegmentedOutputMode(
-                                    current = outputMode,
-                                    onChange = {
-                                        outputMode = it
-                                        AppSettings.setOutputMode(it)
-                                    },
+                                SegmentedChips(
+                                    options = ThemeMode.entries,
+                                    current = themeMode,
+                                    labelOf = { it.label },
+                                    onChange = { SettingsRepository.setThemeMode(it) },
                                 )
                             },
                         )
                     }
-                    if (outputMode == AppSettings.OutputMode.FIXED) {
-                        StaggerItem(1, tokens) {
+                }
+            }
+
+            // ── CONVERT ──
+            item {
+                SettingsGroup(title = "CONVERT") {
+                    StaggerItem(1, tokens) {
+                        SettingItem(
+                            icon = Icons.Default.Folder,
+                            label = "输出模式",
+                            desc = when (outputMode) {
+                                OutputMode.FOLLOW -> "跟随 zip 同目录"
+                                OutputMode.FIXED  -> "输出到指定目录"
+                            },
+                            trailing = {
+                                SegmentedChips(
+                                    options = OutputMode.entries,
+                                    current = outputMode,
+                                    labelOf = { it.label },
+                                    onChange = { SettingsRepository.setOutputMode(it) },
+                                )
+                            },
+                        )
+                    }
+                    if (outputMode == OutputMode.FIXED) {
+                        StaggerItem(2, tokens) {
                             SettingItem(
                                 icon = Icons.Default.Storage,
                                 label = "输出路径",
-                                desc = outputPath.ifBlank { "未选择" },
+                                desc = displayOutputPath(ctx, outputPath),
                                 trailing = {
                                     TextButton(onClick = { pickOutputDir.launch(null) }) {
                                         Text(
@@ -175,13 +208,50 @@ fun SettingsScreen(onBack: () -> Unit) {
                             )
                         }
                     }
+                    StaggerItem(3, tokens) {
+                        SettingItem(
+                            icon = Icons.Default.Folder,
+                            label = "输出命名模板",
+                            desc = "默认 [Ver][Name]；同名产物追加 (n) 不覆盖",
+                            trailing = {
+                                Row(
+                                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                ) {
+                                    NamingPreset.entries.forEach { preset ->
+                                        Chip(
+                                            text = preset.template,
+                                            active = preset == namingPreset,
+                                            onClick = { SettingsRepository.setNamingPreset(preset) },
+                                        )
+                                    }
+                                }
+                            },
+                        )
+                    }
+                    StaggerItem(4, tokens) {
+                        SettingItem(
+                            icon = Icons.Default.AutoAwesome,
+                            label = "转换选项",
+                            desc = optionsSummary(convertOptions),
+                            trailing = {
+                                TextButton(onClick = { SettingsRepository.resetConversionOptions() }) {
+                                    Text(
+                                        "恢复默认",
+                                        color = BlueAccent,
+                                        fontWeight = FontWeight.SemiBold,
+                                    )
+                                }
+                            },
+                        )
+                    }
                 }
             }
 
             // ── DATA ──
             item {
                 SettingsGroup(title = "DATA") {
-                    StaggerItem(2, tokens) {
+                    StaggerItem(5, tokens) {
                         SettingItem(
                             icon = Icons.Default.History,
                             label = "清空历史记录",
@@ -193,7 +263,7 @@ fun SettingsScreen(onBack: () -> Unit) {
                             },
                         )
                     }
-                    StaggerItem(3, tokens) {
+                    StaggerItem(6, tokens) {
                         SettingItem(
                             icon = Icons.Default.Storage,
                             label = "清空缓存",
@@ -211,7 +281,7 @@ fun SettingsScreen(onBack: () -> Unit) {
             // ── DEVELOPER ──
             item {
                 SettingsGroup(title = "DEVELOPER") {
-                    StaggerItem(4, tokens) {
+                    StaggerItem(7, tokens) {
                         SettingItem(
                             icon = Icons.Default.Code,
                             label = "开发者模式",
@@ -219,10 +289,7 @@ fun SettingsScreen(onBack: () -> Unit) {
                             trailing = {
                                 Switch(
                                     checked = devMode,
-                                    onCheckedChange = {
-                                        devMode = it
-                                        AppSettings.setDevMode(it)
-                                    },
+                                    onCheckedChange = { SettingsRepository.setDevMode(it) },
                                 )
                             },
                         )
@@ -233,7 +300,7 @@ fun SettingsScreen(onBack: () -> Unit) {
             // ── ANIMATION ──
             item {
                 SettingsGroup(title = "ANIMATION") {
-                    StaggerItem(5, tokens) {
+                    StaggerItem(8, tokens) {
                         SettingItem(
                             icon = Icons.Default.Speed,
                             label = "动画速率",
@@ -253,7 +320,7 @@ fun SettingsScreen(onBack: () -> Unit) {
             if (devMode) {
                 item {
                     SettingsGroup(title = "DEV TOOLS") {
-                        StaggerItem(6, tokens) {
+                        StaggerItem(9, tokens) {
                             SettingItem(
                                 icon = Icons.Default.Terminal,
                                 label = "查看日志",
@@ -272,8 +339,12 @@ fun SettingsScreen(onBack: () -> Unit) {
             // ── ABOUT ──
             item {
                 SettingsGroup(title = "ABOUT") {
-                    StaggerItem(7, tokens) {
-                        AboutBlock(version = version, onClick = { showVersionDialog = true })
+                    StaggerItem(10, tokens) {
+                        AboutBlock(
+                            appVersion = appVersion,
+                            coreVersion = coreVersion,
+                            onClick = { showVersionDialog = true },
+                        )
                     }
                 }
             }
@@ -282,7 +353,8 @@ fun SettingsScreen(onBack: () -> Unit) {
 
     if (showVersionDialog) {
         VersionInfoDialog(
-            version = version,
+            appVersion = appVersion,
+            coreVersion = coreVersion,
             onDismiss = { showVersionDialog = false },
         )
     }
@@ -315,6 +387,81 @@ fun SettingsScreen(onBack: () -> Unit) {
     }
     if (showLogDialog) {
         LogDialog(onDismiss = { showLogDialog = false })
+    }
+}
+
+/** 转换选项摘要（设置页只显示摘要；详细开关在转换对话框内）。 */
+private fun optionsSummary(options: ConvertOptions): String = buildString {
+    append("着色器适配"); append(if (options.adaptShaders) "开" else "关")
+    append(" · 物品定义"); append(if (options.convertItemDefinitions) "开" else "关")
+    append(" · CIT 转换"); append(if (options.convertCit) "开" else "关")
+    append(" · 参数文件"); append(if (options.writeGenMetadata) "开" else "关")
+    if (options.deleteShaders) append(" · 删除 shaders")
+    if (options.deleteCit) append(" · 删除 CIT")
+}
+
+/** SAF tree URI / 普通路径 → 可读文案。 */
+private fun displayOutputPath(ctx: android.content.Context, path: String): String = when {
+    path.isBlank() -> "未选择"
+    path.startsWith("content://") -> runCatching {
+        DocumentFile.fromTreeUri(ctx, Uri.parse(path))?.name
+    }.getOrNull() ?: "已选择 SAF 目录"
+    else -> path
+}
+
+/** 通用单选 chip（主题/输出模式/命名模板共用）。 */
+@Composable
+private fun <T> SegmentedChips(
+    options: List<T>,
+    current: T,
+    labelOf: (T) -> String,
+    onChange: (T) -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .clip(RoundedCornerShape(999.dp))
+            .background(OnSurfaceLow.copy(alpha = 0.08f))
+            .padding(2.dp),
+        horizontalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        options.forEach { option ->
+            val active = option == current
+            Box(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(999.dp))
+                    .background(if (active) MaterialTheme.colorScheme.surface else Color.Transparent)
+                    .clickable { onChange(option) }
+                    .padding(horizontal = 8.dp, vertical = 4.dp),
+            ) {
+                Text(
+                    labelOf(option),
+                    style = MaterialTheme.typography.labelLarge,
+                    color = if (active) OnSurfaceHigh else OnSurfaceLow,
+                    fontWeight = if (active) FontWeight.SemiBold else FontWeight.Medium,
+                )
+            }
+        }
+    }
+}
+
+/** 小型选择 chip（命名模板）。 */
+@Composable
+private fun Chip(text: String, active: Boolean, onClick: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .clip(RoundedCornerShape(999.dp))
+            .background(
+                if (active) BlueAccent.copy(alpha = 0.14f) else OnSurfaceLow.copy(alpha = 0.06f)
+            )
+            .clickable(onClick = onClick)
+            .padding(horizontal = 8.dp, vertical = 4.dp),
+    ) {
+        Text(
+            text,
+            style = MaterialTheme.typography.labelLarge,
+            color = if (active) BlueAccent else OnSurfaceLow,
+            fontWeight = if (active) FontWeight.SemiBold else FontWeight.Medium,
+        )
     }
 }
 
@@ -465,7 +612,7 @@ private fun SettingItem(
 }
 
 @Composable
-private fun AboutBlock(version: String, onClick: () -> Unit) {
+private fun AboutBlock(appVersion: String, coreVersion: String, onClick: () -> Unit) {
     Column(
         modifier = Modifier
             .clickable(onClick = onClick)
@@ -504,7 +651,7 @@ private fun AboutBlock(version: String, onClick: () -> Unit) {
                     fontWeight = FontWeight.SemiBold,
                 )
                 Text(
-                    "convert-core v$version",
+                    "v$appVersion · convert-core $coreVersion",
                     style = MaterialTheme.typography.bodySmall,
                     color = OnSurfaceLow,
                 )
@@ -513,8 +660,8 @@ private fun AboutBlock(version: String, onClick: () -> Unit) {
         Spacer(Modifier.height(16.dp))
         HorizontalDivider(color = OnSurfaceLow.copy(alpha = 0.18f))
         Spacer(Modifier.height(14.dp))
-        InfoLine("目标平台", "Android 12 - 16")
-        InfoLine("Rust 核心", "convert-core 1.2万行")
+        InfoLine("目标平台", "Android 12+")
+        InfoLine("转换引擎", "桌面 2.203.0 M3 引擎")
         InfoLine("UI 框架", "Jetpack Compose Material 3")
         Spacer(Modifier.height(8.dp))
         Text(
@@ -549,67 +696,16 @@ private fun InfoLine(label: String, value: String) {
 }
 
 @Composable
-private fun SegmentedOutputMode(
-    current: AppSettings.OutputMode,
-    onChange: (AppSettings.OutputMode) -> Unit,
-) {
-    Row(
-        modifier = Modifier
-            .clip(RoundedCornerShape(999.dp))
-            .background(OnSurfaceLow.copy(alpha = 0.08f))
-            .padding(2.dp),
-        horizontalArrangement = Arrangement.spacedBy(2.dp),
-    ) {
-        AppSettings.OutputMode.entries.forEach { m ->
-            val active = m == current
-            Box(
-                modifier = Modifier
-                    .clip(RoundedCornerShape(999.dp))
-                    .background(if (active) Color.White else Color.Transparent)
-                    .clickable { onChange(m) }
-                    .padding(horizontal = 10.dp, vertical = 4.dp),
-            ) {
-                Text(
-                    m.label,
-                    style = MaterialTheme.typography.labelLarge,
-                    color = if (active) OnSurfaceHigh else OnSurfaceLow,
-                    fontWeight = if (active) FontWeight.SemiBold else FontWeight.Medium,
-                )
-            }
-        }
-    }
-}
-
-@Composable
 private fun SegmentedSpeedPicker(
     current: AnimationSpeed,
     onChange: (AnimationSpeed) -> Unit,
 ) {
-    Row(
-        modifier = Modifier
-            .clip(RoundedCornerShape(999.dp))
-            .background(OnSurfaceLow.copy(alpha = 0.08f))
-            .padding(2.dp),
-        horizontalArrangement = Arrangement.spacedBy(2.dp),
-    ) {
-        AnimationSpeed.entries.forEach { sp ->
-            val active = sp == current
-            Box(
-                modifier = Modifier
-                    .clip(RoundedCornerShape(999.dp))
-                    .background(if (active) Color.White else Color.Transparent)
-                    .clickable { onChange(sp) }
-                    .padding(horizontal = 10.dp, vertical = 4.dp),
-            ) {
-                Text(
-                    sp.shortLabel,
-                    style = MaterialTheme.typography.labelLarge,
-                    color = if (active) OnSurfaceHigh else OnSurfaceLow,
-                    fontWeight = if (active) FontWeight.SemiBold else FontWeight.Medium,
-                )
-            }
-        }
-    }
+    SegmentedChips(
+        options = AnimationSpeed.entries,
+        current = current,
+        labelOf = { it.shortLabel },
+        onChange = onChange,
+    )
 }
 
 private enum class AnimationSpeed(val shortLabel: String) {
@@ -619,7 +715,7 @@ private enum class AnimationSpeed(val shortLabel: String) {
 }
 
 @Composable
-private fun VersionInfoDialog(version: String, onDismiss: () -> Unit) {
+private fun VersionInfoDialog(appVersion: String, coreVersion: String, onDismiss: () -> Unit) {
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("版本信息") },
@@ -647,14 +743,20 @@ private fun VersionInfoDialog(version: String, onDismiss: () -> Unit) {
                 }
                 Spacer(Modifier.height(12.dp))
                 Text(
-                    "2-Pyramid v$version",
+                    "2-Pyramid For Android v$appVersion",
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Bold,
                 )
-                Spacer(Modifier.height(20.dp))
+                Spacer(Modifier.height(6.dp))
                 Text(
-                    "v1.2 更新：\n• Bento 网格 + 蓝渐变大格 + 纯白次要\n• 完整 Minecraft pack_format 列表 (1.6-1.21.6+)\n• 设置加输出模式 / 清空历史 / 清空缓存\n• Tab 切换 slide + fade 弹性动画",
+                    "转换引擎 convert-core $coreVersion",
                     style = MaterialTheme.typography.bodyMedium,
+                    color = OnSurfaceLow,
+                )
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "同步基准：桌面版 2.203.0（M3 引擎）",
+                    style = MaterialTheme.typography.bodySmall,
                     color = OnSurfaceLow,
                 )
             }

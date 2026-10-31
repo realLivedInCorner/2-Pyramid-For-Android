@@ -117,12 +117,14 @@ fun HistoryScreen() {
                         onCopy = { record.outputPath?.let { copyToClipboard(ctx, it) } },
                         onRetry = {
                             // 重新入队：缺 sourceUri（持久化历史只存 fileName），入空 URI
-                            // Service 找不到文件会 Failed
+                            // Service 找不到文件会 Failed。（已知遗留，待后续用持久化 SAF 权限修）
                             QueueRepository.enqueue(
                                 QueueItem(
                                     fileName = record.fileName,
                                     sourceUri = android.net.Uri.parse(""),
-                                    targetVersion = record.targetVersion,
+                                    // v2.1：入队冻结当前设置的选项快照（目标版本沿用历史记录）
+                                    options = com.twopyramid.twofa.settings.SettingsRepository
+                                        .snapshotOptions(record.targetVersion),
                                 )
                             )
                         },
@@ -353,6 +355,21 @@ private fun HistoryRow(
                         style = MaterialTheme.typography.bodySmall,
                         color = accent,
                     )
+                    // v2.1：显示 skipped / notes 摘要（notes 既有跳过原因也有普通进展，不统一标跳过）
+                    if (record.skipped > 0) {
+                        Text(
+                            "跳过 ${record.skipped} 项",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = OnSurfaceLow,
+                        )
+                    }
+                    if (record.notes.isNotEmpty()) {
+                        Text(
+                            "引擎备注 ${record.notes.size} 条",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = OnSurfaceLow,
+                        )
+                    }
                 }
                 if (isDone) {
                     IconButton(onClick = onCopy) {

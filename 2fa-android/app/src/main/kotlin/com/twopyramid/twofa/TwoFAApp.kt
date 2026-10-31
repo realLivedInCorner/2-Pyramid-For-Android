@@ -7,6 +7,7 @@ import android.os.Build
 import android.util.Log
 import com.twopyramid.twofa.history.HistoryRepository
 import com.twopyramid.twofa.native.RustNative
+import com.twopyramid.twofa.settings.SettingsRepository
 import java.io.File
 
 /**
@@ -26,6 +27,10 @@ class TwoFAApp : Application() {
         runCatching { initializeRust() }
             .onFailure { Log.e(TAG, "Rust init failed (App continues with placeholder binding)", it) }
 
+        // 设置持久化（SharedPreferences）— 必须在 Compose 首帧前完成：
+        // MainActivity 要用 themeMode 决定深/浅色，晚于此会闪一下错误配色。
+        SettingsRepository.init(this)
+
         // History 持久化（SharedPreferences）— 必须 init
         HistoryRepository.init(this)
 
@@ -36,11 +41,15 @@ class TwoFAApp : Application() {
         val appFilesDir: File = filesDir
         val uimageDir: File = File(appFilesDir, "UImage").apply { mkdirs() }
         val logDir: File = File(appFilesDir, "logs").apply { mkdirs() }
+        // Android 没有可写的 /tmp：引擎 tempfile / std::env::temp_dir() 必须落在 cacheDir。
+        // Rust 侧 init_runtime 会同时 set_var("TMPDIR", tempDir)。
+        val tempDir: File = cacheDir.apply { mkdirs() }
 
         RustNative.initialize(
             logDir = logDir.absolutePath,
             appDataDir = appFilesDir.absolutePath,
-            uimageDir = uimageDir.absolutePath
+            uimageDir = uimageDir.absolutePath,
+            tempDir = tempDir.absolutePath,
         )
     }
 

@@ -236,7 +236,7 @@ private fun SecondaryBlock(
 ) {
     Surface(
         onClick = onClick,
-        color = Color.White,
+        color = MaterialTheme.colorScheme.surface,
         contentColor = OnSurfaceHigh,
         shape = RoundedCornerShape(20.dp),
         border = androidx.compose.foundation.BorderStroke(1.dp, GlassOutline.copy(alpha = 0.6f)),
