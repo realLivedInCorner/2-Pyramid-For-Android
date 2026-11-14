@@ -12,8 +12,8 @@
 | 桌面最后同步点（本次起点） | `0635bdd`（2.1.2，2026-09-12），Android 2.0.0 的 pre-M3 引擎底座 |
 | 差距 | 367 commits；`src-tauri/src` 210 文件 / +34,580 −12,486；`src/` 59 文件 / +14,953 −5,888 |
 | Android 同步前 | git `519f904`（2026-09-12，versionName 2.0.0），分支 `sync/desktop-2.203`，tag `pre-sync-2.0.0` |
-| 同步后目标版本 | versionName **2.1.0**（versionCode 继续自动 +1），convert-core **2.1.0** |
-| 同步策略 | **整体替换式移植**（M3/A-ROM 引擎替换 pre-M3 的 `hurray/`+`converters/`）+ Android 适配层 + Kotlin/Compose 转换能力对齐 |
+| 同步后目标版本 | versionName **2.1.0**（`versionCode` 来自仓库根 `BUILD`=**21000**，构建只读/发布显式推进），convert-core **2.1.0** |
+| 同步策略 | **整体替换式移植**（M3/A-ROM 引擎替换 pre-M3 的 `hurray/`+`converters/`）+ Android 适配层 + Kotlin/Compose 转换能力对齐 + 按主仓库规范重做 UI/仓库（§8） |
 
 ## 2. 分层执行状态（对应 plan 文档）
 
@@ -113,9 +113,14 @@
   binding **62,800 B**（uniffi 0.32 生成，含 `ConvertOptions`/`ConvertRequest`/`ConvertReport`/`ConvertProgress`/4 参 `initRuntime`）；
 - 全链 `:app:assembleDebug`（含 Rust 构建）：**BUILD SUCCESSFUL 16.4s**；
   `:app:assembleRelease`（R8 + resource shrink）：**BUILD SUCCESSFUL 64.1s**；
-- release APK（打包 UImage 后最终）：**10,706,339 B（10.2 MB）**，`versionName=2.1.0`、`versionCode` 每次构建自动 +1
-  （最终构建 37）、`minSdk=31`/`targetSdk=37`；APK 内含 `lib/arm64-v8a/libconvert_core.so` 5,736,688 B 与
-  `assets/UImage/` 80 个文件（570,387 B）；`grep -ri tauri convert-core/src` 无输出。
+- release APK（UImage 后、旧「自动 versionCode」时期）：**10,706,339 B（10.2 MB）**，`versionName=2.1.0`、
+  `versionCode` 每次构建自动 +1（当时最终 37）、`minSdk=31`/`targetSdk=37`；APK 内含
+  `lib/arm64-v8a/libconvert_core.so` 5,736,688 B 与 `assets/UImage/` 80 个文件（570,387 B）；
+  `grep -ri tauri convert-core/src` 无输出。
+- **UI/仓库规范追加后（2.1.0 最终口径）**：`versionCode = BUILD = 21000`；release APK 本地构建
+  10,594,451 B，使用仓库内 `tools/ci/debug.keystore` 签名（apksigner 证书
+  `CN=Android Debug,O=Android,C=US`）；CI 会用自己的可复现构建产出并附带 `.apk.sha256`
+  （本地与 CI 哈希天然不同，正文由 workflow 写入实际值）。详见 §8。
 
 ### 4.3 产物差分（Android 引擎 host runner vs 桌面 2.203.0 CLI）
 - 对 `_sync/reference/no-uimage` 全部 **15 个 case**：**15/15 PASS，unexplained=0**
@@ -165,3 +170,61 @@
 3. 桌面 logo 定稿后单独同步品牌资产；
 4. CI 增强：`cargo test`、Kotlin 编译校验、差分回归（当前 `build.yml` 只 assembleDebug）；
 5. 下次同步流程：桌面合并后按 `desktop-sync-2.203-report.md` 的「结构映射」做引擎目录级 diff（不再 cherry-pick）。
+
+## 8. 追加：按主仓库规范更新 UI 与 GitHub 仓库（2026-11-14）
+
+> 用户要求「按主仓库规范更新 UI，并准备好提交 GitHub；GitHub 也按主仓库存在的规范来」。
+> 主仓库仍是 2.203.0（HEAD `3dd0e45`），因此视觉/流程基准就是它的 `brand/`、`docs/compose/spec/`、
+> `legal/`、`.github/`、`BUILD`/`CHANGELOG`/`set_version.py`/release workflow 体系。
+
+### 8.1 UI（Precision Geometry + 设计语言）
+
+- **品牌**：`brand/` 7 个 SVG 从桌面逐字节复制（唯一矢量源）；`tools/generate-android-brand.mjs`
+  纯 Node 幂等生成 `brand_mark/_white/favicon/_favicon_white/micro`、adaptive icon 前景 + monochrome、
+  Android 12 splash（日/夜）；启动图标 = 白底板 + favicon 加粗稿（62dp 墨迹 ≤66dp 安全区），
+  避免 512 mark 直接缩导致 48px 线消失。旧 `2pyr-logo.svg` / `ic_pyramid_*` 删除。
+- **设计令牌**（`ui/theme/`）：暖纸墨色板（浅 `#F4F2EE`/深 `#1A1815`）、ink 四级、danger/warn/ok、
+  暖色发丝线、8 档字阶（24→10.5sp）、字重 ≤600、圆角 12/8/6、**默认无投影**；动效
+  160/200/240/280/320/360/1000ms + 4 条 easing、减少动效语义、动画速率三档；全部蓝/Slate 冷色归零。
+- **强调色**：默认 ink `#14171A`，设置→外观 HSV 选择器（SV 面板 + 色相条 + hex + 恢复默认）；
+  深色按 **OKLab 42% 白** 派生（与桌面 `color-mix(in oklab, …42%, #fff)` 同口径，#14171A→#929496，
+  深底对比 5.34）。
+- **统一壳**：`BrandDialog`/`BrandSheet`（暖 scrim 0.34、surface、1dp 发丝线、12dp 圆角、20dp 内边距、
+  15sp/600 标题、32dp/8dp/13sp 按钮）；Convert 版本弹窗/详情、Settings 全部弹窗、History 确认迁移完毕，
+  不再有 AlertDialog/ModalBottomSheet 自定义样式。
+- **页面**：Home（brand_mark 44dp + 品牌名 + 标语 + accent CTA + 暖色阶梯背景，删除蓝色极光）、
+  Convert（版本选择 status 徽章 ok/accent/ink3、六选项行、危险项二次确认、warn 警示、真进度、
+  结果 skipped/notes）、History（发丝线行、语义徽章）、Settings（10.5sp uppercase 分组标题；
+  APPEARANCE 主题/强调色/动画速率；ABOUT 品牌 mark 72dp + v2.1.0 + BUILD + 引擎版本）、
+  MainActivity/AppNavHost 暖色首帧与 160–240ms 过渡。
+- 未做：主按钮轻微投影（手机扁平更稳）、Settings 装饰搜索框移除、App 内 legal 入口（P1）、真机走查。
+
+### 8.2 GitHub 仓库规范
+
+- 新增 `BUILD`（21000）/ `CHANGELOG.md` / `legal/`（中英各 6 份）/ `.github/CONTRIBUTING.md` /
+  `.github/SECURITY.md` / `docs/compose/releases/news-2.1.0.md` / `tools/set_version.py`；
+  `README` 改为桌面风格（brand `<picture>`、徽章、双语、BUILD/CHANGELOG/legal 链接）。
+- **版本机制**：`versionCode` 读 `BUILD`（构建只读），删除 `version.properties` 自动 +1；
+  `set_version.py --check` 校验 tag 渠道前缀/versionName/BUILD/README 徽章/news（发布前显式 `--set`）。
+- **发布流程**：release workflow 改为渠道前缀 tag 触发（`Stable-*`/`Safe-*`/`Beta-*`/`UnStable-*`），
+  解析版本/BUILD/news、版本一致性校验、构建 APK + `.apk.sha256`、`gh release create`
+  标题 `2-Pyramid for Android {Stable|Beta} <版本>-BUILD<build>`，Beta/UnStable→prerelease，
+  正文 = news + **本次 CI 产物实际 SHA-256**；`build.yml` 加无 tag 版本自检；两个 workflow 都不再回写版本文件。
+- **签名**：发行用仓库内公开的 **debug keystore** `tools/ci/debug.keystore`（CI/本地共用，跨版本签名稳定、
+  可覆盖安装；取代旧 CI 每次现场生成新密钥 → 每次签名不同无法升级）。它是调试级密钥，**任何人都能重签**，
+  完整性以 Release 附带 `.apk.sha256` 为准（legal/SECURITY 已披露）。
+- **CI 修正**：`android-actions/setup-android@v3` 无 `ndk-version`/`sdk-version` 输入，改为在 `packages`
+  安装 `platforms;android-37.0`、`build-tools;37.0.0`、`ndk;27.3.13750724`；
+  `tools/build-rust-android.sh` 在 crate 目录内调用 uniffi-bindgen（0.32 仍跑 cargo metadata）。
+
+### 8.3 验证（2.1.0 发布前）
+
+- `:app:assembleDebug` 62,077,140 B；`:app:assembleRelease` 10,594,451 B，`versionCode=21000`/
+  `versionName=2.1.0`/minSdk 31/targetSdk 37/arm64-v8a；apksigner 验签通过（`CN=Android Debug`）。
+- 静态检查：冷色/旧 logo/tauri grep 全 0；`generate-android-brand.mjs --check` exit 0；
+  `set_version.py --check`（`GITHUB_REF_NAME=Stable-2.1.0`）6 项通过；UImage 80 项/570,387 B；
+  新图标/adaptive/monochrome/splash 资源均在 APK 内。
+- 回归：`cargo test --lib` 220 passed/6 ignored；`android_smoke` 6 passed；host 差分 f15→55、TapL→97
+  均 PASS（unexplained=0）。详见 `_sync/reports/ui-repo-verify.md`。
+- 未验证：真机/模拟器（无设备）、GitHub Actions 实际运行（发布后观察）、Rust 全链重编（引擎未改，
+  复用 .so/binding；L6 已有全链证据）。

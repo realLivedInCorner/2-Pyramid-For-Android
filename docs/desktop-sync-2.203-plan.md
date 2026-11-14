@@ -410,3 +410,19 @@ L2/L3/L4/L5 各一个逻辑提交或一组；L7 统一整理 + 最终提交；**
  → L6 全链 assembleDebug + 桌面 CLI 差分 + APK 检查
  → L7 版本号/README/AGENTS/同步记录/最终提交
 ```
+
+## 10. L8（追加，2026-11-14）：按主仓库规范更新 UI 与 GitHub 仓库
+
+> 用户要求在主仓库（桌面 2.203.0）品牌/设计/仓库规范下重做 Android UI 并发布到 GitHub。
+> 详细结果见 `desktop-sync-2.203.md` §8；仓库根文件（README/legal/BUILD/CHANGELOG/workflows）同步落地。
+
+| 子层 | 内容 | 验收 |
+|---|---|---|
+| L8-a 品牌 | `brand/` 唯一矢量源 + `tools/generate-android-brand.mjs` 幂等生成 drawable/adaptive/monochrome/splash；删除旧 logo | 生成器两次 0 diff；aapt2 编译通过；旧引用 0 |
+| L8-b 设计令牌 | `ui/theme/{Color,Type,Motion,Oklab}.kt`：暖纸墨 30+ token、8 档字阶、圆角 12/8/6、无默认投影、动效 token/减少动效、OKLab 深色派生 | `compileDebugKotlin`；蓝/Slate 冷色 grep 0 |
+| L8-c 组件/页面 | 唯一弹窗壳 `BrandDialog`/`BrandSheet`、`BrandPanel`、HSV 强调色选择器；Home/Convert/History/Settings/MainActivity/AppNavHost 重做 | 编译 + 功能回归（选项/进度/结果/SAF 逻辑不变） |
+| L8-d 仓库规范 | `BUILD`/`CHANGELOG`/`legal` 中英 12 份/`.github/CONTRIBUTING|SECURITY`/`news-2.1.0.md`/`tools/set_version.py`/README；删除 `version.properties` 自增 | `set_version.py --check`（tag=Stable-2.1.0）通过 |
+| L8-e 发布 | release workflow 渠道 tag、版本校验、APK+`.apk.sha256`、标题/正文（news + CI 实际 SHA-256）；`build.yml` 自检；`tools/ci/debug.keystore` 稳定签名 | CI 实跑（发布后观察）；失败则本地兜底 `gh release create` |
+| L8-f 验证/发布 | verify-release 独立构建/静态检查/回归/sha256；Lead 提交、push main、tag `Stable-2.1.0`、GitHub Release | 两 APK PASS；15/15 差分不变；Release 资产/标题/notes 正确 |
+
+回滚：L8-a/b/c 可整体 revert 到 `feat(ui)` 之前；L8-d/e 的发布由 tag 决定，撤回 Release/tag 即可。

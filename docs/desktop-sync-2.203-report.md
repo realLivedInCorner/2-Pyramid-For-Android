@@ -727,3 +727,18 @@ L0 报告把「UImage 原版资源不打包」列为 out-of-scope；实施完成
 host 差分对 `reference/with-uimage` 的 15 个 case 复测 **15/15 PASS**，证明依赖 UImage 的生成任务与桌面一致；
 代价是 release APK +0.6 MB（10.1 → 10.2 MB）。真机首次解压与像素结果仍待验证。
 同一个「Kotlin 嵌套注释」坑在新增 Kotlin 注释里复现（`assets/UImage/**`），规则已扩展见 C1。
+
+### C5. v2.1.0 发布前追加：按主仓库规范更新 UI 与 GitHub 仓库（2026-11-14）
+
+L0 报告把「桌面专属/品牌」列为不同步；后续按用户要求把**视觉与仓库规范**也同步了：
+
+- **UI**：采用桌面 Precision Geometry 品牌（`brand/` + 幂等生成器 → drawable/adaptive/monochrome/splash），
+  设计令牌切换到 shared.css 的暖纸墨体系（颜色/8 档字阶/圆角/无默认投影/动效 token/减少动效），
+  统一弹窗壳，页面（Home/Convert/History/Settings）重做，并实现桌面同款的**可选强调色**
+  （HSV + OKLab 42% 白深色派生）。
+- **GitHub 规范**：新增 `BUILD`（versionCode 来源，构建只读）、`CHANGELOG`、`legal/`（中英 12 份）、
+  `.github/CONTRIBUTING|SECURITY`、`news-2.1.0.md`、`tools/set_version.py`；release workflow 改为渠道前缀
+  tag 触发并创建带 `.apk.sha256` 的 GitHub Release；发行签名改为仓库内公开 debug keystore
+  （跨版本签名稳定、可覆盖安装）。
+- 详细记录见 `desktop-sync-2.203.md` §8、`desktop-sync-2.203-plan.md` §10，
+  验证证据见 `_sync/reports/ui-repo-verify.md`；本次仍无真机/模拟器截图。
