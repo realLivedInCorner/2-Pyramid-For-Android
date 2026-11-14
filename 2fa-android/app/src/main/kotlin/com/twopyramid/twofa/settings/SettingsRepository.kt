@@ -25,8 +25,15 @@ object SettingsRepository {
 
     private const val PREFS_NAME = "twofa.settings"
 
+    // 外观默认值（与 ui/theme 的 DEFAULT_THEME_COLOR_HEX / Motion.SPEED_NORMAL 对齐；此处不 import UI 层，
+    // 保持 settings 包对 Compose 无依赖，颜色解析在 MainActivity / Theme 做）。
+    private const val DEFAULT_THEME_COLOR = "#14171A"
+    private const val DEFAULT_MOTION_SCALE = 1.0f
+
     // ── keys（写入后不要随意改名，否则老用户设置丢失）─────────────────
     private const val KEY_THEME_MODE = "theme_mode"
+    private const val KEY_THEME_COLOR = "theme_color"
+    private const val KEY_MOTION_SCALE = "motion_scale"
     private const val KEY_OUTPUT_MODE = "output_mode"
     private const val KEY_OUTPUT_PATH = "output_path"
     private const val KEY_NAMING_PRESET = "output_naming_preset"
@@ -52,6 +59,15 @@ object SettingsRepository {
     // ── 响应式状态（Service 只写 / UI 只收集）────────────────────────
     private val _themeMode = MutableStateFlow(ThemeMode.SYSTEM)
     val themeMode: StateFlow<ThemeMode> = _themeMode.asStateFlow()
+
+    // 强调色（mapping §5）：默认墨色；用户在 设置 → 外观 里用 HSV 选择器自选。
+    // 存 #RRGGBB 原始色，深色下的派生版本由 ui.theme.Oklab 在渲染时计算（OKLab 42% 白混合）。
+    private val _themeColor = MutableStateFlow(DEFAULT_THEME_COLOR)
+    val themeColor: StateFlow<String> = _themeColor.asStateFlow()
+
+    // 动画速率三档（慢 1.4 / 标准 1.0 / 快 0.7）→ MotionTokens 的时长倍数（mapping §3.4）。
+    private val _motionScale = MutableStateFlow(DEFAULT_MOTION_SCALE)
+    val motionScale: StateFlow<Float> = _motionScale.asStateFlow()
 
     private val _outputMode = MutableStateFlow(OutputMode.FOLLOW)
     val outputMode: StateFlow<OutputMode> = _outputMode.asStateFlow()
@@ -84,6 +100,8 @@ object SettingsRepository {
             prefs = p
 
             _themeMode.value = ThemeMode.fromValue(p.getString(KEY_THEME_MODE, null))
+            _themeColor.value = normalizeThemeColor(p.getString(KEY_THEME_COLOR, null))
+            _motionScale.value = normalizeMotionScale(p.getFloat(KEY_MOTION_SCALE, DEFAULT_MOTION_SCALE))
             _outputMode.value = OutputMode.fromValue(p.getString(KEY_OUTPUT_MODE, null))
             _outputPath.value = p.getString(KEY_OUTPUT_PATH, "") ?: ""
 
@@ -127,6 +145,45 @@ object SettingsRepository {
         _themeMode.value = mode
         edit { putString(KEY_THEME_MODE, mode.value) }
     }
+
+    // ── 强调色 / 动画速率（外观）──────────────────────────────────
+    /**
+     * 写入强调色（#RRGGBB）。非法输入回退默认墨色；返回实际生效的值，
+     * 便于 UI 在确认弹窗后显示「当前颜色」。
+     */
+    fun setThemeColor(hex: String): String {
+        val normalized = normalizeThemeColor(hex)
+        if (_themeColor.value == normalized) return normalized
+        _themeColor.value = normalized
+        edit { putString(KEY_THEME_COLOR, normalized) }
+        return normalized
+    }
+
+    /** 恢复默认强调色（墨色 #14171A）。 */
+    fun resetThemeColor(): String = setThemeColor(DEFAULT_THEME_COLOR)
+
+    fun setMotionScale(scale: Float) {
+        val normalized = normalizeMotionScale(scale)
+        if (_motionScale.value == normalized) return
+        _motionScale.value = normalized
+        edit { putFloat(KEY_MOTION_SCALE, normalized) }
+    }
+
+    fun currentThemeColor(): String = _themeColor.value
+
+    fun currentMotionScale(): Float = _motionScale.value
+
+    private fun normalizeThemeColor(value: String?): String {
+        val raw = value?.trim().orEmpty()
+        val body = if (raw.startsWith("#")) raw.substring(1) else raw
+        if (body.length != 6 || body.any { it.digitToIntOrNull(16) == null }) {
+            return DEFAULT_THEME_COLOR
+        }
+        return "#" + body.uppercase()
+    }
+
+    private fun normalizeMotionScale(scale: Float): Float =
+        if (scale in 0.5f..2.0f) scale else DEFAULT_MOTION_SCALE
 
     /**
      * 把主题模式解析成实际是否深色。

@@ -1,9 +1,6 @@
 package com.twopyramid.twofa.ui.components
 
 import androidx.compose.foundation.Image
-import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -12,120 +9,56 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Brush
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.res.painterResource
-import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.compose.material3.Text
 import com.twopyramid.twofa.R
-import com.twopyramid.twofa.ui.theme.BlueAccent
-import com.twopyramid.twofa.ui.theme.OnSurfaceLow
-import com.twopyramid.twofa.ui.theme.OnSurfaceHigh
+import com.twopyramid.twofa.ui.theme.AppText
+import com.twopyramid.twofa.ui.theme.Paper
 
-/**
- * 2-Pyramid 品牌头（PC 端 HomePage.vue .brand-block 等价）。
- *
- * 排版从大到小：
- *   ① Logo（圆形 + 浅蓝径向 + Image tint，可选 showLogo=false 隐藏）
- *   ② 主标 2-Pyramid          56sp / 900 / 紧 tracking / 居中
- *   ③ 副标 for Android  + version pill    同行
- *   ④ 长描述 tagline          12sp / 0.6 tracking / 浅灰 / 居中
- */
+// 首页品牌块（mapping §4 Home）：brand_mark 44dp 盒 + 品牌名 + 标语 + 元信息行。
+//
+// brand_mark 是纯黑线条 + 透明底，深色下会隐形 —— 所以这里统一用
+// painterResource + ColorFilter.tint(ink)：浅色下是墨线，深色下 ink 翻成暖白，
+// 不需要额外维护 brand_mark_white 的另一份渲染路径。
+//
+// 44dp 盒对应新版 mark 71.5% 墨迹占比 → 可见墨迹约 31.5dp，与桌面 HomePage
+// 的 .brand-mark 尺寸/留白换算一致。
+// 品牌名是**唯一**允许 700 字重的标识文本（其余 UI 文本 ≤600）。
 @Composable
 fun BrandHeader(
-    productLine: String = "for Android",
-    tagline: String = "The Nextgen Multi-Version Universal Resource Pack Converter",
-    versionPill: String? = null,
-    logoSize: Dp = 80.dp,
-    showLogo: Boolean = true,
     modifier: Modifier = Modifier,
+    tagline: String = "Modern Universal Multi-Version Resource Pack Converter",
+    meta: String? = null,
 ) {
-    Column(
-        modifier = modifier
-            .fillMaxWidth()
-            .padding(horizontal = 24.dp, vertical = 16.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(4.dp),
-    ) {
-        if (showLogo) {
-            // ① Logo：圆形 + 浅蓝径向 + Image tint
-            Box(
-                modifier = Modifier
-                    .size(logoSize)
-                    .clip(CircleShape)
-                    .background(
-                        brush = Brush.radialGradient(
-                            colors = listOf(
-                                BlueAccent.copy(alpha = 0.30f),
-                                BlueAccent.copy(alpha = 0.10f),
-                                Color.Transparent,
-                            ),
-                        ),
-                    ),
-                contentAlignment = Alignment.Center,
-            ) {
-                Image(
-                    painter = painterResource(R.drawable.ic_pyramid_logo),
-                    contentDescription = null,
-                    colorFilter = ColorFilter.tint(BlueAccent),
-                    modifier = Modifier.size(logoSize * 0.55f),
-                )
-            }
-            Spacer(Modifier.height(8.dp))
-        }
-
-        // ② 主标（独立一行，避免被副标挤成竖排）
-        Text(
-            text = "2-Pyramid",
-            style = MaterialTheme.typography.displayLarge,
-            color = OnSurfaceHigh,
-            textAlign = TextAlign.Center,
-        )
-
-        // ③ 副标 for Android + version pill
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.Center,
-        ) {
-            Text(
-                text = productLine,
-                style = MaterialTheme.typography.titleMedium,
-                color = OnSurfaceLow,
+    val c = Paper.colors
+    Column(modifier = modifier.fillMaxWidth()) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Image(
+                painter = painterResource(R.drawable.brand_mark),
+                contentDescription = null,
+                colorFilter = ColorFilter.tint(c.ink),
+                modifier = Modifier.size(44.dp),
             )
-            if (versionPill != null) {
-                Spacer(Modifier.width(8.dp))
-                Box(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(BlueAccent.copy(alpha = 0.12f))
-                        .padding(horizontal = 8.dp, vertical = 2.dp),
-                ) {
-                    Text(
-                        text = versionPill,
-                        style = MaterialTheme.typography.labelLarge,
-                        color = BlueAccent,
-                    )
-                }
+            Spacer(Modifier.width(12.dp))
+            Column {
+                Text("2-Pyramid", style = AppText.brandName, color = c.ink)
+                Spacer(Modifier.height(2.dp))
+                Text(tagline, style = AppText.tagline, color = c.ink3)
             }
         }
-
-        // ④ 长描述副标
-        Text(
-            text = tagline,
-            style = MaterialTheme.typography.bodyMedium,
-            color = OnSurfaceLow,
-            textAlign = TextAlign.Center,
-            modifier = Modifier.padding(top = 4.dp),
-        )
+        if (!meta.isNullOrBlank()) {
+            Spacer(Modifier.height(10.dp))
+            Text(
+                text = meta.uppercase(),
+                style = AppText.label,
+                color = c.ink3,
+                modifier = Modifier.padding(start = 2.dp),
+            )
+        }
     }
 }

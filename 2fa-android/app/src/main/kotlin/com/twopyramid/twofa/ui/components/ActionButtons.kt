@@ -1,8 +1,7 @@
 package com.twopyramid.twofa.ui.components
 
-import androidx.compose.animation.core.animateDpAsState
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -12,110 +11,86 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Icon
-import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
-import com.twopyramid.twofa.ui.theme.BlueAccent
+import com.twopyramid.twofa.ui.theme.AppText
+import com.twopyramid.twofa.ui.theme.Paper
+import com.twopyramid.twofa.ui.theme.TwoFAShapes
 
-/**
- * Primary / Secondary 两组按钮〟 *
- * 主要用于 BottomSheet、Card 内的操作行。点击有轻微按下缩放反馈〟 */
+// 页面级操作按钮（mapping §4 组件：8dp 圆角、32/40dp 高、ink/accent）。
+// 投影默认无 —— 只有弹窗浮层保留投影，按钮的「主」靠墨/强调色底而不是靠抬升。
+// 弹窗页脚用 BrandDialogButton（32dp），这里只放页面/面板内的 40dp 按钮。
 
 @Composable
 fun PrimaryActionButton(
     text: String,
     onClick: () -> Unit,
-    leadingIcon: ImageVector? = null,
     modifier: Modifier = Modifier,
+    leadingIcon: ImageVector? = null,
+    enabled: Boolean = true,
+    height: Dp = 40.dp,
 ) {
-    FilledPill(
-        text = text,
-        background = MaterialTheme.colorScheme.primary,
-        foreground = MaterialTheme.colorScheme.onPrimary,
-        onClick = onClick,
-        leadingIcon = leadingIcon,
-        modifier = modifier,
-    )
+    val c = Paper.colors
+    CompositionLocalProvider(LocalContentColor provides c.onAccent) {
+        Box(
+            modifier = modifier
+                .height(height)
+                .clip(TwoFAShapes.control)
+                .background(if (enabled) c.accent else c.accent.copy(alpha = 0.45f))
+                .clickable(enabled = enabled, onClick = onClick)
+                .padding(horizontal = 18.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (leadingIcon != null) {
+                    Icon(leadingIcon, contentDescription = null, tint = c.onAccent, modifier = Modifier.size(17.dp))
+                    Spacer(Modifier.width(7.dp))
+                }
+                Text(text, style = AppText.buttonStrong, color = c.onAccent, maxLines = 1)
+            }
+        }
+    }
 }
 
 @Composable
 fun SecondaryActionButton(
     text: String,
     onClick: () -> Unit,
+    modifier: Modifier = Modifier,
     leadingIcon: ImageVector? = null,
-    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+    height: Dp = 40.dp,
 ) {
-    FilledPill(
-        text = text,
-        background = MaterialTheme.colorScheme.surface,
-        foreground = MaterialTheme.colorScheme.onSurface,
-        onClick = onClick,
-        leadingIcon = leadingIcon,
-        modifier = modifier
-            .then(
-                Modifier.background(
-                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
-                    shape = RoundedCornerShape(14.dp),
-                ),
-            ),
-    )
-}
-
-@Composable
-private fun FilledPill(
-    text: String,
-    background: androidx.compose.ui.graphics.Color,
-    foreground: androidx.compose.ui.graphics.Color,
-    onClick: () -> Unit,
-    leadingIcon: ImageVector?,
-    modifier: Modifier = Modifier,
-) {
-    var pressed by remember { mutableStateOf(false) }
-    val padX by animateDpAsState(
-        targetValue = if (pressed) 12.dp else 16.dp,
-        animationSpec = tween(120),
-        label = "press-pad",
-    )
-    Box(
-        modifier = modifier
-            .clip(RoundedCornerShape(14.dp))
-            .background(background)
-            .clickable {
-                pressed = true
-                onClick()
-                pressed = false
+    val c = Paper.colors
+    val contentColor = if (enabled) c.ink2 else c.ink4
+    CompositionLocalProvider(LocalContentColor provides contentColor) {
+        Box(
+            modifier = modifier
+                .height(height)
+                .clip(TwoFAShapes.control)
+                .background(Color.Transparent)
+                .border(1.dp, c.hairlineStrong, TwoFAShapes.control)
+                .clickable(enabled = enabled, onClick = onClick)
+                .padding(horizontal = 16.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (leadingIcon != null) {
+                    Icon(leadingIcon, contentDescription = null, tint = contentColor, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(6.dp))
+                }
+                Text(text, style = AppText.button, color = contentColor, maxLines = 1)
             }
-            .padding(horizontal = padX, vertical = 12.dp),
-        contentAlignment = Alignment.Center,
-    ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            if (leadingIcon != null) {
-                Icon(
-                    leadingIcon,
-                    contentDescription = null,
-                    tint = foreground,
-                    modifier = Modifier.size(18.dp),
-                )
-                Spacer(Modifier.width(8.dp))
-            }
-            Text(
-                text,
-                style = MaterialTheme.typography.labelLarge,
-                color = foreground,
-                fontWeight = FontWeight.SemiBold,
-            )
         }
     }
 }

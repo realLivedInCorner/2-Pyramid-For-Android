@@ -1,20 +1,22 @@
 package com.twopyramid.twofa.ui
 
-import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.tween
-import androidx.compose.animation.core.CubicBezierEasing
 import androidx.compose.animation.AnimatedContentTransitionScope
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
-import androidx.compose.animation.scaleIn
-import androidx.compose.animation.scaleOut
-import androidx.compose.animation.slideInHorizontally
-import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
+import androidx.compose.animation.core.CubicBezierEasing
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
@@ -29,13 +31,13 @@ import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
@@ -46,42 +48,43 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
+import com.twopyramid.twofa.ui.components.HairlineDivider
 import com.twopyramid.twofa.ui.screens.ConvertScreen
 import com.twopyramid.twofa.ui.screens.HistoryScreen
 import com.twopyramid.twofa.ui.screens.HomeScreen
 import com.twopyramid.twofa.ui.screens.SettingsScreen
-import com.twopyramid.twofa.ui.theme.BlueAccent
-import com.twopyramid.twofa.ui.theme.OnSurfaceHigh
-import com.twopyramid.twofa.ui.theme.OnSurfaceLow
+import com.twopyramid.twofa.ui.theme.AppText
+import com.twopyramid.twofa.ui.theme.Motion
+import com.twopyramid.twofa.ui.theme.Paper
+import com.twopyramid.twofa.ui.theme.TwoFAShapes
+import com.twopyramid.twofa.ui.theme.motion
 import kotlin.math.abs
 
-/**
- * App 顶层导航 + 底部 NavigationBar。
- *
- * 路由：
- *   - "/"           Home (介绍 + 入口)
- *   - "/convert"    ConvertScreen (队列 + 添加 Zip)  ← 从 Home 按钮 push
- *   - "/history"    HistoryScreen (历史记录)
- *   - "/settings"   SettingsScreen (开发者模式 / 动画 / 关于)
- *
- * Tab 切换：底部 navBar 3 项（队列 history settings）。Home 内点 "开始转换" push ConvertScreen。
- * ConvertScreen / SettingsScreen 显示返回按钮，back 回 Home。
- *
- * 转场：横向 slide + fade（PC 端 cubic-bezier(0.2, 0.8, 0.2, 1) 的 Android 等价）
- */
+// ══ 顶层导航 + 底部 NavigationBar（mapping §4 Navigation）══════════════
+//
+// 路由：
+//   "/"          Home
+//   "/convert"   转换队列（Home 进入）
+//   "/history"   历史
+//   "/settings"  设置
+//
+// 转场：ease-out 160–240ms 的 fade + 轻微上移（不再 520ms 横滑）；减少动效时瞬时切换。
+// 底栏：surface 底 + 顶部 1dp 暖发丝线，选中色 = accent（默认墨色），不用蓝色。
+// 左右滑切 tab 手势保留；提示 chip 改用暖纸墨面板样式。
+
 @Composable
 fun AppNavHost() {
     val nav = rememberNavController()
     val backStackEntry by nav.currentBackStackEntryAsState()
     val currentRoute = backStackEntry?.destination?.route
+    val m = motion
 
     Scaffold(
         bottomBar = {
-            GlassNavBar(
+            WarmNavBar(
                 currentRoute = currentRoute,
                 onSelect = { tab ->
-                    if (tab.route == currentRoute) return@GlassNavBar
-                    // 标准 tab pattern：popUpTo startDestination（inclusive=false 保留 Home）+ launchSingleTop
+                    if (tab.route == currentRoute) return@WarmNavBar
                     nav.navigate(tab.route) {
                         popUpTo(nav.graph.findStartDestination().id) { inclusive = false }
                         launchSingleTop = true
@@ -91,7 +94,6 @@ fun AppNavHost() {
         },
         containerColor = androidx.compose.ui.graphics.Color.Transparent,
     ) { innerPadding ->
-        // 当前 tab 在底部 nav 列表里的下标（找不到时按 0 处理）
         val currentIndex = tabs.indexOfFirst { it.route == currentRoute }.coerceAtLeast(0)
 
         SwipeTabDetector(
@@ -99,7 +101,6 @@ fun AppNavHost() {
             currentIndex = currentIndex,
             totalPages = tabs.size,
             onPrev = {
-                // 右滑 → 切到上一个 tab（上）
                 val prev = tabs.getOrNull(currentIndex - 1) ?: return@SwipeTabDetector
                 nav.navigate(prev.route) {
                     popUpTo(nav.graph.findStartDestination().id) { inclusive = false }
@@ -107,7 +108,6 @@ fun AppNavHost() {
                 }
             },
             onNext = {
-                // 左滑 → 切到下一个 tab（下）
                 val next = tabs.getOrNull(currentIndex + 1) ?: return@SwipeTabDetector
                 nav.navigate(next.route) {
                     popUpTo(nav.graph.findStartDestination().id) { inclusive = false }
@@ -120,40 +120,42 @@ fun AppNavHost() {
                 startDestination = Routes.HOME,
                 modifier = Modifier.fillMaxSize(),
                 enterTransition = {
-                    // 进入：右滑 1/5 + 淡入；cubic-bezier(0.22, 1, 0.36, 1) 弹性收尾
-                    slideInHorizontally(
-                        initialOffsetX = { it / 5 },
-                        animationSpec = tween(520, easing = CubicBezierEasing(0.22f, 1f, 0.36f, 1f)),
-                    ) + fadeIn(
-                        animationSpec = tween(380, easing = CubicBezierEasing(0.22f, 1f, 0.36f, 1f)),
-                    )
+                    if (m.reduced) {
+                        EnterTransitionNone
+                    } else {
+                        fadeIn(
+                            animationSpec = tween(m.pageEnterMs(), easing = Motion.easeOut),
+                        ) + slideInVertically(
+                            initialOffsetY = { it / 24 },
+                            animationSpec = tween(m.pageEnterMs(), easing = Motion.easeOut),
+                        )
+                    }
                 },
                 exitTransition = {
-                    // 离开：左滑 1/12 + 淡出（淡出比 slide 快，避免"内容留太久"）
-                    slideOutHorizontally(
-                        targetOffsetX = { -it / 12 },
-                        animationSpec = tween(360, easing = CubicBezierEasing(0.4f, 0f, 0.2f, 1f)),
-                    ) + fadeOut(
-                        animationSpec = tween(220, easing = CubicBezierEasing(0.4f, 0f, 0.2f, 1f)),
-                    )
+                    if (m.reduced) {
+                        ExitTransitionNone
+                    } else {
+                        fadeOut(animationSpec = tween(m.pageExitMs(), easing = Motion.easeIn))
+                    }
                 },
                 popEnterTransition = {
-                    // back 返回：左滑 1/12 + 淡入
-                    slideInHorizontally(
-                        initialOffsetX = { -it / 12 },
-                        animationSpec = tween(520, easing = CubicBezierEasing(0.22f, 1f, 0.36f, 1f)),
-                    ) + fadeIn(
-                        animationSpec = tween(380, easing = CubicBezierEasing(0.22f, 1f, 0.36f, 1f)),
-                    )
+                    if (m.reduced) {
+                        EnterTransitionNone
+                    } else {
+                        fadeIn(
+                            animationSpec = tween(m.pageEnterMs(), easing = Motion.easeOut),
+                        ) + slideInVertically(
+                            initialOffsetY = { it / 24 },
+                            animationSpec = tween(m.pageEnterMs(), easing = Motion.easeOut),
+                        )
+                    }
                 },
                 popExitTransition = {
-                    // back 离开：右滑 1/5 + 淡出
-                    slideOutHorizontally(
-                        targetOffsetX = { it / 5 },
-                        animationSpec = tween(360, easing = CubicBezierEasing(0.4f, 0f, 0.2f, 1f)),
-                    ) + fadeOut(
-                        animationSpec = tween(220, easing = CubicBezierEasing(0.4f, 0f, 0.2f, 1f)),
-                    )
+                    if (m.reduced) {
+                        ExitTransitionNone
+                    } else {
+                        fadeOut(animationSpec = tween(m.pageExitMs(), easing = Motion.easeIn))
+                    }
                 },
             ) {
                 composable(Routes.HOME) {
@@ -177,6 +179,13 @@ fun AppNavHost() {
     }
 }
 
+// 减少动效时的导航转场：瞬时切换。
+private val EnterTransitionNone: androidx.compose.animation.EnterTransition
+    get() = androidx.compose.animation.EnterTransition.None
+
+private val ExitTransitionNone: androidx.compose.animation.ExitTransition
+    get() = androidx.compose.animation.ExitTransition.None
+
 object Routes {
     const val HOME = "/"
     const val CONVERT = "/convert"
@@ -184,30 +193,8 @@ object Routes {
     const val SETTINGS = "/settings"
 }
 
-/**
- * 横向 swipe 切 tab 的手势检测器。
- *
- * 行为：
- *   - 右滑累积超过 [swipeThreshold] → 调 onPrev（切到上一个 tab / "上"）
- *   - 左滑累积超过 [swipeThreshold] → 调 onNext（切到下一个 tab / "下"）
- *   - 第一个 tab 右滑 / 最后一个 tab 左滑不响应（边界保护）
- *   - drag 触发后会给一次 haptic 反馈（LongPress 触觉）
- *
- * v1.3 阻尼反馈（damping feedback）：
- *   - drag 中实时显示屏幕中央箭头 overlay（← 指示上一个 / → 指示下一个）
- *   - 箭头 alpha 跟 drag 距离/阈值比例 (0..1) 联动
- *   - 箭头带 cubic-bezier(0.22, 1, 0.36, 1) 弹性入场,符合项目"慢 + 弹性"动画风格
- *   - 拖到位切 tab 时触发 spring 回弹 + 短暂淡出
- *   - 给"系统在响应你的手势"明确的视觉信号,避免 swipe 不可见
- *
- * 实现细节：
- *   - 用 detectHorizontalDragGestures 而非 Modifier.draggable，因为前者不与 LazyColumn 垂直
- *     滚动争抢（detectHorizontalDragGestures 只对水平 drag 回调，垂直 drag 透传）。
- *   - 累积 drag 距离，到阈值触发一次；触发后 reset 0，避免一次拖动连续切两个 tab。
- *   - 触发后不 consume 下层 change,允许 NavHost 内可能的水平 scrollable 区域仍能响应（虽然
- *     当前 4 个 tab 都没有水平 scrollable,这是预留保险）。
- *   - pointerInput key = currentIndex,tab 切换时重新订阅,totalDragX / dragProgress 自动重置。
- */
+// 横向 swipe 切 tab（保留原行为）：累积超过阈值 → 切上/下一个 tab，边界不响应。
+// drag 中在屏幕边缘显示方向 chip（阻尼反馈）；chip 走暖纸墨面板样式。
 @Composable
 private fun SwipeTabDetector(
     currentIndex: Int,
@@ -219,14 +206,13 @@ private fun SwipeTabDetector(
     content: @Composable () -> Unit,
 ) {
     val haptic = LocalHapticFeedback.current
-    // drag progress: -1..1，< 0 = 左滑（下一个），> 0 = 右滑（上一个）。animateFloatAsState 走
-    // 弹性 cubic-bezier 缓动，让 overlay 跟手有"惯性"感
+    val m = motion
     var rawProgress by remember { mutableFloatStateOf(0f) }
     val animatedProgress by animateFloatAsState(
         targetValue = rawProgress,
         animationSpec = tween(
-            durationMillis = 320,
-            easing = CubicBezierEasing(0.22f, 1f, 0.36f, 1f),
+            durationMillis = m.ms(Motion.slow),
+            easing = Motion.easeOut,
         ),
         label = "swipeProgress",
     )
@@ -242,19 +228,15 @@ private fun SwipeTabDetector(
                     onDragEnd = { totalDragX = 0f; rawProgress = 0f },
                     onDragCancel = { totalDragX = 0f; rawProgress = 0f },
                 ) { _, dragAmount ->
-                    // 不 consume change,下层水平 scrollable 仍能响应（当前 4 tab 都没用水平 scroll）
                     totalDragX += dragAmount
-                    // 归一化进度:0..1。clamp 让 hint 在触到阈值后不再继续放大
                     rawProgress = (totalDragX / thresholdPx).coerceIn(-1f, 1f)
                     when {
-                        // 左滑（负 dragAmount 累积到负值）→ 下一个 tab
                         totalDragX <= -thresholdPx && currentIndex < totalPages - 1 -> {
                             haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                             onNext()
                             totalDragX = 0f
                             rawProgress = 0f
                         }
-                        // 右滑（正 dragAmount 累积到正值）→ 上一个 tab
                         totalDragX >= thresholdPx && currentIndex > 0 -> {
                             haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                             onPrev()
@@ -263,12 +245,10 @@ private fun SwipeTabDetector(
                         }
                     }
                 }
-            }
+            },
     ) {
         content()
 
-        // 阻尼反馈 overlay:左/右滑分别在对应边缘显示箭头
-        // 仅在 drag 进度有值时显示,松手后弹回 0 顺便淡出
         if (abs(animatedProgress) > 0.02f) {
             SwipeHintOverlay(
                 progress = animatedProgress,
@@ -279,14 +259,6 @@ private fun SwipeTabDetector(
     }
 }
 
-/**
- * swipe hint overlay:屏幕左/右边缘的"←/→"半透明圆形按钮
- *
- * - 进度 < 0（左滑）:右侧显示 → 箭头
- * - 进度 > 0（右滑）:左侧显示 ← 箭头
- * - 边界时(currentIndex 在首/尾):对应方向 hint 提示弱化(alpha 更低)
- * - alpha 跟 |progress| 联动(0..1),progress = 0.5 时 hint 半透
- */
 @Composable
 private fun SwipeHintOverlay(
     progress: Float,
@@ -299,37 +271,28 @@ private fun SwipeHintOverlay(
         contentAlignment = Alignment.Center,
     ) {
         when {
-            // 左滑（progress < 0）→ 右侧显示 →（下一个）
             progress < 0f && canNext -> {
                 HintChip(
                     icon = Icons.AutoMirrored.Filled.KeyboardArrowRight,
                     label = "下一个",
                     alpha = hintAlpha,
-                    modifier = Modifier
-                        .align(Alignment.CenterEnd)
-                        .padding(end = 24.dp),
+                    modifier = Modifier.align(Alignment.CenterEnd).padding(end = 24.dp),
                 )
             }
-            // 右滑（progress > 0）→ 左侧显示 ←（上一个）
             progress > 0f && canPrev -> {
                 HintChip(
                     icon = Icons.AutoMirrored.Filled.KeyboardArrowLeft,
                     label = "上一个",
                     alpha = hintAlpha,
-                    modifier = Modifier
-                        .align(Alignment.CenterStart)
-                        .padding(start = 24.dp),
+                    modifier = Modifier.align(Alignment.CenterStart).padding(start = 24.dp),
                 )
             }
-            // 边界方向:显示更弱的提示(alpha 0.3)告诉用户"到头了"
             progress < 0f && !canNext -> {
                 HintChip(
                     icon = Icons.AutoMirrored.Filled.KeyboardArrowRight,
                     label = "已是末页",
                     alpha = 0.3f,
-                    modifier = Modifier
-                        .align(Alignment.CenterEnd)
-                        .padding(end = 24.dp),
+                    modifier = Modifier.align(Alignment.CenterEnd).padding(end = 24.dp),
                 )
             }
             progress > 0f && !canPrev -> {
@@ -337,19 +300,14 @@ private fun SwipeHintOverlay(
                     icon = Icons.AutoMirrored.Filled.KeyboardArrowLeft,
                     label = "已是首页",
                     alpha = 0.3f,
-                    modifier = Modifier
-                        .align(Alignment.CenterStart)
-                        .padding(start = 24.dp),
+                    modifier = Modifier.align(Alignment.CenterStart).padding(start = 24.dp),
                 )
             }
         }
     }
 }
 
-/**
- * 圆形 hint chip:半透磨砂背景 + 大箭头 + 副标签
- * alpha 0..1 由 caller 决定
- */
+// 方向提示 chip：surface + 1dp 发丝线 + 圆形，无投影。
 @Composable
 private fun HintChip(
     icon: ImageVector,
@@ -357,24 +315,21 @@ private fun HintChip(
     alpha: Float,
     modifier: Modifier = Modifier,
 ) {
-    androidx.compose.material3.Surface(
-        modifier = modifier,
-        shape = androidx.compose.foundation.shape.CircleShape,
-        color = BlueAccent.copy(alpha = alpha * 0.18f),
-        contentColor = OnSurfaceHigh,
+    val c = Paper.colors
+    Box(
+        modifier = modifier
+            .size(56.dp)
+            .clip(CircleShape)
+            .background(c.surface.copy(alpha = alpha))
+            .border(1.dp, c.hairlineStrong.copy(alpha = alpha), CircleShape),
+        contentAlignment = Alignment.Center,
     ) {
-        Box(
-            modifier = Modifier
-                .size(56.dp),
-            contentAlignment = Alignment.Center,
-        ) {
-            Icon(
-                imageVector = icon,
-                contentDescription = label,
-                tint = BlueAccent.copy(alpha = alpha),
-                modifier = Modifier.size(36.dp),
-            )
-        }
+        Icon(
+            imageVector = icon,
+            contentDescription = label,
+            tint = c.ink2.copy(alpha = alpha),
+            modifier = Modifier.size(28.dp),
+        )
     }
 }
 
@@ -392,29 +347,44 @@ private val tabs = listOf(
 )
 
 @Composable
-private fun GlassNavBar(
+private fun WarmNavBar(
     currentRoute: String?,
     onSelect: (NavTab) -> Unit,
 ) {
-    NavigationBar(
-        containerColor = androidx.compose.ui.graphics.Color.Transparent,
-        tonalElevation = 0.dp,
-    ) {
-        tabs.forEach { tab ->
-            val selected = currentRoute == tab.route
-            NavigationBarItem(
-                selected = selected,
-                onClick = { onSelect(tab) },
-                icon = { Icon(tab.icon, contentDescription = tab.label) },
-                label = { Text(tab.label) },
-                colors = NavigationBarItemDefaults.colors(
-                    selectedIconColor = BlueAccent,
-                    selectedTextColor = BlueAccent,
-                    indicatorColor = BlueAccent.copy(alpha = 0.18f),
-                    unselectedIconColor = androidx.compose.material3.MaterialTheme.colorScheme.onSurfaceVariant,
-                    unselectedTextColor = androidx.compose.material3.MaterialTheme.colorScheme.onSurfaceVariant,
-                ),
-            )
+    val c = Paper.colors
+    Column {
+        HairlineDivider()
+        NavigationBar(
+            containerColor = c.surface,
+            tonalElevation = 0.dp,
+        ) {
+            tabs.forEach { tab ->
+                val selected = currentRoute == tab.route
+                NavigationBarItem(
+                    selected = selected,
+                    onClick = { onSelect(tab) },
+                    icon = { Icon(tab.icon, contentDescription = tab.label) },
+                    label = {
+                        Text(
+                            tab.label,
+                            style = AppText.tagline.copy(
+                                fontWeight = if (selected) {
+                                    androidx.compose.ui.text.font.FontWeight.Medium
+                                } else {
+                                    androidx.compose.ui.text.font.FontWeight.Normal
+                                },
+                            ),
+                        )
+                    },
+                    colors = NavigationBarItemDefaults.colors(
+                        selectedIconColor = c.accent,
+                        selectedTextColor = c.accent,
+                        indicatorColor = c.accent.copy(alpha = 0.10f),
+                        unselectedIconColor = c.ink3,
+                        unselectedTextColor = c.ink3,
+                    ),
+                )
+            }
         }
     }
 }

@@ -10,10 +10,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
-import androidx.compose.animation.scaleIn
-import androidx.compose.animation.slideInVertically
-import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -25,7 +23,6 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -33,28 +30,18 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Check
-import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.FolderZip
-import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Warning
-import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -69,6 +56,7 @@ import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -82,39 +70,50 @@ import com.twopyramid.twofa.settings.ConvertOptions
 import com.twopyramid.twofa.settings.NamingPreset
 import com.twopyramid.twofa.settings.SettingsRepository
 import com.twopyramid.twofa.ui.Texts
-import com.twopyramid.twofa.ui.components.GlassCard
+import com.twopyramid.twofa.ui.components.BrandConfirmDialog
+import com.twopyramid.twofa.ui.components.BrandDialog
+import com.twopyramid.twofa.ui.components.BrandPanel
+import com.twopyramid.twofa.ui.components.BrandSheet
+import com.twopyramid.twofa.ui.components.DangerTag
+import com.twopyramid.twofa.ui.components.DialogButtonTone
+import com.twopyramid.twofa.ui.components.DialogTextButton
+import com.twopyramid.twofa.ui.components.HairlineDivider
+import com.twopyramid.twofa.ui.components.IconGlyphButton
+import com.twopyramid.twofa.ui.components.InfoLine
+import com.twopyramid.twofa.ui.components.PageTopBar
 import com.twopyramid.twofa.ui.components.PrimaryActionButton
+import com.twopyramid.twofa.ui.components.SearchField
 import com.twopyramid.twofa.ui.components.SecondaryActionButton
-import com.twopyramid.twofa.ui.theme.AmberNotice
-import com.twopyramid.twofa.ui.theme.BlueAccent
-import com.twopyramid.twofa.ui.theme.CrimsonWarn
-import com.twopyramid.twofa.ui.theme.LocalTwoFATokens
-import com.twopyramid.twofa.ui.theme.OnSurfaceHigh
-import com.twopyramid.twofa.ui.theme.OnSurfaceLow
+import com.twopyramid.twofa.ui.components.StatusBadge
+import com.twopyramid.twofa.ui.components.StatusTone
+import com.twopyramid.twofa.ui.components.VersionChip
+import com.twopyramid.twofa.ui.components.WarnBanner
+import com.twopyramid.twofa.ui.theme.AppText
+import com.twopyramid.twofa.ui.theme.Motion
+import com.twopyramid.twofa.ui.theme.Paper
+import com.twopyramid.twofa.ui.theme.TwoFAShapes
+import com.twopyramid.twofa.ui.theme.motion
 import com.twopyramid.twofa.ui.viewmodel.HomeViewModel
 import java.util.Locale
 
-/**
- * ConvertScreen：队列 + 添加 Zip + ItemDetail + 「选择目标版本与转换选项」对话框。
- *
- * v2.1（桌面 2.203.0 同步，L4/L5）：
- *  - 版本表 27 项（新增 26.3/97），状态徽章对齐桌面；
- *  - 目标版本对话框内嵌**转换选项区**（6 个用户可见开关 + 命名模板预设），
- *    危险项红色「会删文件」标记 + 二次确认；26.3/Bedrock 选择即非阻塞警示；
- *  - 真实进度链路：ProgressRepository（Service 只写 / UI 只收集），不再用本地假动画；
- *  - 入队后自动启动前台服务（旧版只有"重新转换"路径启动，S24）；
- *  - Android 13+ POST_NOTIFICATIONS 运行时权限（不阻塞转换）。
- *
- * `fix_alpha_layers` 是桌面 M3 后的死开关，**不在 UI 暴露**（字段保留在 ConvertOptions）。
- */
-@OptIn(ExperimentalMaterial3Api::class)
+// ══ Convert（mapping §4 Convert）══════════════════════════════════════
+//
+// 保留 v2.1 全部业务逻辑：SAF 选包（takePersistableUriPermission）、入队快照、前台服务启动、
+// 通知权限、7 个转换开关（fix_alpha_layers 不暴露）、危险项二次确认、26.3/Bedrock 非阻塞警示、
+// 真进度（ProgressRepository）、结果面板 skipped/notes。
+//
+// 视觉重做点：版本选择弹窗 / 详情 sheet 全部改用统一 BrandDialog / BrandSheet 壳；
+// 状态徽章用 ok/accent/ink3（不再用蓝色）；危险项 danger + 「会删文件」；26.3/Bedrock 用 warn 色。
+
+// 危险开关（需要 danger 标记 + 二次确认的项）
+private enum class DangerKind { DELETE_SHADERS, DELETE_CIT }
+
 @Composable
 fun ConvertScreen(onBack: () -> Unit) {
     val ctx = LocalContext.current
     val viewModel: HomeViewModel = viewModel()
     val items by viewModel.queue.collectAsState()
     val progressMap by ProgressRepository.items.collectAsState()
-    val tokens = LocalTwoFATokens.current
     val lastTargetVersion by SettingsRepository.lastTargetVersion.collectAsState()
 
     var pendingUri by remember { mutableStateOf<Uri?>(null) }
@@ -146,7 +145,7 @@ fun ConvertScreen(onBack: () -> Unit) {
     }
 
     val pickZipLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocument()
+        contract = ActivityResultContracts.OpenDocument(),
     ) { uri ->
         if (uri != null) {
             runCatching {
@@ -161,22 +160,44 @@ fun ConvertScreen(onBack: () -> Unit) {
 
     val onPickZip: () -> Unit = { pickZipLauncher.launch(arrayOf("application/zip", "*/*")) }
 
-    val sheetState = androidx.compose.material3.rememberModalBottomSheetState(skipPartiallyExpanded = true)
-
     Column(modifier = Modifier.fillMaxSize()) {
-        ConvertTopBar(
-            itemCount = items.size,
-            hasPending = items.any { it.status is QueueItem.Status.Queued },
+        PageTopBar(
+            title = "转换",
             onBack = onBack,
-            onAdd = onPickZip,
+            trailing = {
+                if (items.isNotEmpty()) {
+                    val hasPending = items.any { it.status is QueueItem.Status.Queued }
+                    Box(
+                        modifier = Modifier
+                            .clip(TwoFAShapes.row)
+                            .border(1.dp, Paper.colors.hairline, TwoFAShapes.row)
+                            .padding(horizontal = 8.dp, vertical = 2.dp),
+                    ) {
+                        Text(
+                            if (hasPending) "${items.size} 项待转换" else "${items.size} 项",
+                            style = AppText.tagline,
+                            color = Paper.colors.ink3,
+                        )
+                    }
+                    Spacer(Modifier.width(4.dp))
+                }
+                IconGlyphButton(
+                    icon = Icons.Filled.Add,
+                    contentDescription = "添加 Zip",
+                    onClick = onPickZip,
+                    tint = Paper.colors.ink2,
+                    size = 32.dp,
+                    iconSize = 20.dp,
+                )
+            },
         )
+
         Box(modifier = Modifier.weight(1f)) {
             if (items.isEmpty()) {
                 ConvertEmpty(onAdd = onPickZip)
             } else {
                 ConvertList(
                     items = items,
-                    tokens = tokens,
                     progress = progressMap,
                     onItemClick = { detailItem = it },
                 )
@@ -204,12 +225,7 @@ fun ConvertScreen(onBack: () -> Unit) {
 
     if (detailItem != null) {
         val current = items.firstOrNull { it.id == detailItem!!.id }
-        androidx.compose.material3.ModalBottomSheet(
-            onDismissRequest = { detailItem = null },
-            sheetState = sheetState,
-            containerColor = MaterialTheme.colorScheme.surface,
-            contentColor = MaterialTheme.colorScheme.onSurface,
-        ) {
+        BrandSheet(onDismiss = { detailItem = null }) {
             if (current != null) {
                 ConvertDetailSheet(
                     item = current,
@@ -230,126 +246,61 @@ fun ConvertScreen(onBack: () -> Unit) {
 }
 
 @Composable
-private fun ConvertTopBar(
-    itemCount: Int,
-    hasPending: Boolean,
-    onBack: () -> Unit,
-    onAdd: () -> Unit,
-) {
+private fun ConvertEmpty(onAdd: () -> Unit) {
+    val c = Paper.colors
     Column(
         modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 8.dp, vertical = 8.dp),
+            .fillMaxSize()
+            .padding(horizontal = 20.dp),
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = onBack) {
-                Icon(Icons.Filled.ArrowBack, contentDescription = "返回", tint = OnSurfaceHigh)
-            }
-            Spacer(Modifier.width(4.dp))
-            Text(
-                "转换",
-                style = MaterialTheme.typography.headlineLarge,
-                color = OnSurfaceHigh,
-                fontWeight = FontWeight.Black,
-            )
-            Spacer(Modifier.weight(1f))
-            if (itemCount > 0) {
+        BrandPanel(modifier = Modifier.fillMaxWidth()) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 24.dp, vertical = 32.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
                 Box(
                     modifier = Modifier
-                        .clip(RoundedCornerShape(999.dp))
-                        .background(BlueAccent.copy(alpha = 0.10f))
-                        .padding(horizontal = 10.dp, vertical = 4.dp),
+                        .size(56.dp)
+                        .clip(CircleShape)
+                        .background(c.surface3),
+                    contentAlignment = Alignment.Center,
                 ) {
-                    Text(
-                        if (hasPending) "$itemCount 项待转换" else "$itemCount 项",
-                        style = MaterialTheme.typography.labelLarge,
-                        color = BlueAccent,
+                    Icon(
+                        Icons.Filled.FolderZip,
+                        contentDescription = null,
+                        tint = c.ink3,
+                        modifier = Modifier.size(26.dp),
                     )
                 }
-                Spacer(Modifier.width(4.dp))
-            }
-            // 顶部右侧 + 按钮（替代 v1.2.x 的右下 FAB，Material 3 标准模式）
-            IconButton(onClick = onAdd) {
-                Icon(Icons.Filled.Add, contentDescription = "添加 Zip", tint = OnSurfaceHigh)
+                Spacer(Modifier.height(18.dp))
+                Text("还没有待转换的 zip", style = AppText.itemTitle, color = c.ink)
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    "从文件管理器里选一个 Minecraft 资源包",
+                    style = AppText.body,
+                    color = c.ink3,
+                    textAlign = TextAlign.Center,
+                )
+                Spacer(Modifier.height(22.dp))
+                PrimaryActionButton(text = "选择 Zip 文件", onClick = onAdd)
             }
         }
-    }
-}
-
-@Composable
-private fun ConvertEmpty(modifier: Modifier = Modifier, onAdd: () -> Unit) {
-    AnimatedVisibility(
-        visible = true,
-        enter = fadeIn() + scaleIn(initialScale = 0.96f),
-        modifier = modifier.fillMaxSize(),
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(horizontal = 24.dp),
-            verticalArrangement = Arrangement.Center,
-            horizontalAlignment = Alignment.CenterHorizontally,
-        ) {
-            GlassCard(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(24.dp),
-                elevation = 2.dp,
-                shadowRadius = 12.dp,
-            ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 24.dp, vertical = 32.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .size(72.dp)
-                            .clip(CircleShape)
-                            .background(BlueAccent.copy(alpha = 0.12f)),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Icon(
-                            Icons.Filled.FolderZip,
-                            contentDescription = null,
-                            tint = BlueAccent,
-                            modifier = Modifier.size(36.dp),
-                        )
-                    }
-                    Spacer(Modifier.height(20.dp))
-                    Text(
-                        "还没有待转换的 zip",
-                        style = MaterialTheme.typography.titleLarge,
-                        color = OnSurfaceHigh,
-                        fontWeight = FontWeight.SemiBold,
-                    )
-                    Spacer(Modifier.height(6.dp))
-                    Text(
-                        "从文件管理器里选一个 Minecraft 资源包",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = OnSurfaceLow,
-                    )
-                    Spacer(Modifier.height(24.dp))
-                    PrimaryActionButton(
-                        text = "选择 Zip 文件",
-                        onClick = onAdd,
-                    )
-                }
-            }
-            Spacer(Modifier.height(20.dp))
-            Text(
-                "提示：选完文件后可以挑目标版本和转换选项",
-                style = MaterialTheme.typography.bodySmall,
-                color = OnSurfaceLow,
-            )
-        }
+        Spacer(Modifier.height(16.dp))
+        Text(
+            "选完文件后可以挑目标版本和转换选项",
+            style = AppText.tagline,
+            color = c.ink4,
+        )
     }
 }
 
 @Composable
 private fun ConvertList(
     items: List<QueueItem>,
-    tokens: com.twopyramid.twofa.ui.theme.TwoFATokens,
     progress: Map<String, ItemProgress>,
     onItemClick: (QueueItem) -> Unit,
     modifier: Modifier = Modifier,
@@ -357,15 +308,13 @@ private fun ConvertList(
     LazyColumn(
         modifier = modifier
             .fillMaxSize()
-            .padding(horizontal = 16.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp),
-        contentPadding = PaddingValues(top = 4.dp, bottom = 96.dp),
+            .padding(horizontal = 20.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+        contentPadding = PaddingValues(top = 4.dp, bottom = 24.dp),
     ) {
         items(items, key = { it.id }) { item ->
             ConvertRow(
                 item = item,
-                index = items.indexOf(item),
-                tokens = tokens,
                 progress = progress[item.id],
                 onClick = { onItemClick(item) },
             )
@@ -376,31 +325,23 @@ private fun ConvertList(
 @Composable
 private fun ConvertRow(
     item: QueueItem,
-    index: Int,
-    tokens: com.twopyramid.twofa.ui.theme.TwoFATokens,
     progress: ItemProgress?,
     onClick: () -> Unit,
 ) {
+    val c = Paper.colors
+    val m = motion
     val visibleState = remember { androidx.compose.animation.core.MutableTransitionState(false) }
-    androidx.compose.runtime.LaunchedEffect(item.id) {
-        kotlinx.coroutines.delay(index * tokens.staggerDelayMs.toLong())
-        visibleState.targetState = true
-    }
+    androidx.compose.runtime.LaunchedEffect(item.id) { visibleState.targetState = true }
+
     AnimatedVisibility(
         visibleState = visibleState,
         enter = fadeIn(
             animationSpec = androidx.compose.animation.core.tween(
-                durationMillis = tokens.entranceDurationMs,
-                easing = tokens.staggerEasing,
-            ),
-        ) + slideInVertically(
-            initialOffsetY = { it / 4 },
-            animationSpec = androidx.compose.animation.core.tween(
-                durationMillis = tokens.entranceDurationMs,
-                easing = tokens.staggerEasing,
+                durationMillis = if (m.reduced) m.fadeMs() else m.ms(Motion.base),
+                easing = Motion.easeOut,
             ),
         ),
-        exit = fadeOut() + slideOutVertically(targetOffsetY = { it / 4 }),
+        exit = fadeOut(animationSpec = androidx.compose.animation.core.tween(durationMillis = m.fadeMs())),
     ) {
         ConvertRowCard(item = item, progress = progress, onClick = onClick)
     }
@@ -408,65 +349,56 @@ private fun ConvertRow(
 
 @Composable
 private fun ConvertRowCard(item: QueueItem, progress: ItemProgress?, onClick: () -> Unit) {
-    val accent: Color = when (item.status) {
-        is QueueItem.Status.Done    -> Color(0xFF22C55E)
-        is QueueItem.Status.Failed  -> MaterialTheme.colorScheme.error
-        is QueueItem.Status.Running -> BlueAccent
-        is QueueItem.Status.Queued  -> OnSurfaceLow.copy(alpha = 0.6f)
+    val c = Paper.colors
+    val statusTone = when (item.status) {
+        is QueueItem.Status.Done -> StatusTone.OK
+        is QueueItem.Status.Failed -> StatusTone.DANGER
+        is QueueItem.Status.Running -> StatusTone.ACCENT
+        is QueueItem.Status.Queued -> StatusTone.INK
+    }
+    val statusLabel = when (item.status) {
+        is QueueItem.Status.Done -> "完成"
+        is QueueItem.Status.Failed -> "失败"
+        is QueueItem.Status.Running -> "转换中"
+        is QueueItem.Status.Queued -> "排队中"
     }
 
-    GlassCard(
+    BrandPanel(
         modifier = Modifier
             .fillMaxWidth()
             .clickable(onClick = onClick),
-        shape = RoundedCornerShape(20.dp),
-        elevation = 1.dp,
-        shadowRadius = 8.dp,
     ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .heightIn(min = 76.dp)
-                .padding(end = 8.dp),
+                .padding(start = 14.dp, end = 8.dp, top = 12.dp, bottom = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            Box(
-                modifier = Modifier
-                    .width(4.dp)
-                    .fillMaxSize()
-                    .background(accent),
-            )
-
-            Column(
-                modifier = Modifier
-                    .weight(1f)
-                    .padding(horizontal = 16.dp, vertical = 12.dp),
-            ) {
-                Text(
-                    item.fileName,
-                    style = MaterialTheme.typography.titleMedium,
-                    color = OnSurfaceHigh,
-                    fontWeight = FontWeight.Medium,
-                    maxLines = 1,
-                )
-                Spacer(Modifier.height(4.dp))
+            Column(modifier = Modifier.weight(1f)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Box(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(BlueAccent.copy(alpha = 0.10f))
-                            .padding(horizontal = 6.dp, vertical = 1.dp),
-                    ) {
-                        Text(
-                            "→ ${AppSettings.versionShort(item.targetVersion)}",
-                            style = MaterialTheme.typography.labelLarge,
-                            color = BlueAccent,
-                        )
-                    }
+                    Text(
+                        item.fileName,
+                        style = AppText.itemTitle,
+                        color = c.ink,
+                        maxLines = 1,
+                        modifier = Modifier.weight(1f, fill = false),
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    StatusBadge(label = statusLabel, tone = statusTone)
+                }
+                Spacer(Modifier.height(5.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    VersionChip("→ ${AppSettings.versionShort(item.targetVersion)}")
                     Spacer(Modifier.width(8.dp))
                     Text(
-                        item.status.label,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = OnSurfaceLow,
+                        when (val s = item.status) {
+                            is QueueItem.Status.Failed -> s.reason
+                            is QueueItem.Status.Done -> s.outputPath.substringAfterLast('/')
+                            else -> "pack_format ${item.targetVersion}"
+                        },
+                        style = AppText.tagline,
+                        color = c.ink3,
+                        maxLines = 1,
                     )
                 }
                 if (item.status is QueueItem.Status.Running) {
@@ -477,34 +409,32 @@ private fun ConvertRowCard(item: QueueItem, progress: ItemProgress?, onClick: ()
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(3.dp)
-                            .clip(RoundedCornerShape(2.dp)),
-                        color = BlueAccent,
-                        trackColor = MaterialTheme.colorScheme.surfaceVariant,
+                            .clip(TwoFAShapes.row),
+                        color = c.accent,
+                        trackColor = c.surface3,
                     )
-                    Spacer(Modifier.height(4.dp))
+                    Spacer(Modifier.height(5.dp))
                     Text(
                         Texts.progressLine(progress?.phase, percent),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = OnSurfaceLow,
+                        style = AppText.tagline.copy(fontFeatureSettings = "tnum"),
+                        color = c.ink3,
                     )
                 }
             }
-
             if (item.status is QueueItem.Status.Done || item.status is QueueItem.Status.Failed) {
-                IconButton(onClick = { QueueRepository.remove(item.id) }) {
-                    Icon(
-                        Icons.Default.Delete,
-                        contentDescription = "移除",
-                        tint = OnSurfaceLow.copy(alpha = 0.6f),
-                    )
-                }
+                Spacer(Modifier.width(4.dp))
+                IconGlyphButton(
+                    icon = Icons.Default.Delete,
+                    contentDescription = "移除",
+                    onClick = { QueueRepository.remove(item.id) },
+                    tint = c.ink4,
+                    size = 32.dp,
+                    iconSize = 16.dp,
+                )
             }
         }
     }
 }
-
-/** 危险开关（需要红色标记 + 二次确认的项）。 */
-private enum class DangerKind { DELETE_SHADERS, DELETE_CIT }
 
 @Composable
 private fun ConvertVersionDialog(
@@ -515,22 +445,25 @@ private fun ConvertVersionDialog(
     onConfirm: () -> Unit,
     onVersionChange: (Int) -> Unit,
 ) {
+    val c = Paper.colors
     var query by remember { mutableStateOf("") }
     val options by SettingsRepository.convertOptions.collectAsState()
     val namingPreset by SettingsRepository.namingPreset.collectAsState()
     var pendingDanger by remember { mutableStateOf<DangerKind?>(null) }
 
     val filtered = remember(query, versions) {
-        if (query.isBlank()) versions
-        else versions.filter {
-            it.packFormat.toString().contains(query) ||
-                it.label.contains(query, ignoreCase = true) ||
-                it.range.contains(query, ignoreCase = true) ||
-                it.era.label.contains(query, ignoreCase = true)
+        if (query.isBlank()) {
+            versions
+        } else {
+            versions.filter {
+                it.packFormat.toString().contains(query) ||
+                    it.label.contains(query, ignoreCase = true) ||
+                    it.range.contains(query, ignoreCase = true) ||
+                    it.era.label.contains(query, ignoreCase = true)
+            }
         }
     }
 
-    // 按 era 分组
     val grouped: List<Pair<AppSettings.VersionEra, List<AppSettings.VersionEntry>>> =
         remember(filtered) {
             AppSettings.VersionEra.entries
@@ -538,222 +471,98 @@ private fun ConvertVersionDialog(
                 .filter { it.second.isNotEmpty() }
         }
 
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("选择目标版本与选项") },
-        text = {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(max = 520.dp)
-                    .verticalScroll(rememberScrollState()),
-            ) {
-                Text(
-                    fileName,
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = OnSurfaceLow,
-                    modifier = Modifier.padding(bottom = 8.dp),
-                )
-                // 搜索框
+    BrandDialog(
+        onDismiss = onDismiss,
+        title = "选择目标版本",
+        subtitle = fileName,
+        maxWidth = 480.dp,
+        footer = {
+            DialogTextButton(text = Texts.cancel, onClick = onDismiss, tone = DialogButtonTone.QUIET)
+            DialogTextButton(text = Texts.startConvert, onClick = onConfirm, tone = DialogButtonTone.PRIMARY)
+        },
+    ) {
+        SearchField(
+            value = query,
+            onValueChange = { query = it },
+            placeholder = "搜索版本（1.20 / 19 / 试炼…）",
+        )
+
+        if (grouped.isEmpty()) {
+            Text(
+                "没找到匹配「$query」",
+                style = AppText.body,
+                color = c.ink3,
+                modifier = Modifier.padding(vertical = 12.dp),
+            )
+        } else {
+            grouped.forEach { (era, eraItems) ->
                 Row(
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 2.dp),
                     verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(10.dp))
-                        .background(OnSurfaceLow.copy(alpha = 0.06f))
-                        .padding(horizontal = 12.dp, vertical = 6.dp),
                 ) {
-                    Icon(
-                        Icons.Filled.Search,
-                        contentDescription = null,
-                        tint = OnSurfaceLow,
-                        modifier = Modifier.size(18.dp),
-                    )
-                    Spacer(Modifier.width(8.dp))
-                    androidx.compose.foundation.text.BasicTextField(
-                        value = query,
-                        onValueChange = { query = it },
-                        singleLine = true,
-                        textStyle = MaterialTheme.typography.bodyMedium.copy(color = OnSurfaceHigh),
-                        cursorBrush = androidx.compose.ui.graphics.SolidColor(BlueAccent),
-                        modifier = Modifier.weight(1f).padding(vertical = 6.dp),
-                        decorationBox = { inner ->
-                            if (query.isEmpty()) {
-                                Text("搜索版本（1.20 / 19 / 试炼...）", color = OnSurfaceLow)
-                            }
-                            inner()
-                        },
-                    )
-                    if (query.isNotEmpty()) {
-                        IconButton(
-                            onClick = { query = "" },
-                            modifier = Modifier.size(20.dp),
-                        ) {
-                            Icon(
-                                Icons.Filled.Close,
-                                contentDescription = "清空",
-                                tint = OnSurfaceLow,
-                                modifier = Modifier.size(14.dp),
-                            )
-                        }
-                    }
-                }
-                Spacer(Modifier.height(12.dp))
-
-                // era 分组 + version cards
-                if (grouped.isEmpty()) {
-                    Text(
-                        "没找到匹配 \"$query\"",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = OnSurfaceLow,
-                        modifier = Modifier.padding(16.dp),
-                    )
-                } else {
-                    grouped.forEach { (era, items) ->
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 4.dp, vertical = 6.dp),
-                        ) {
-                            Text(
-                                era.label,
-                                style = MaterialTheme.typography.labelLarge,
-                                color = BlueAccent,
-                                fontWeight = FontWeight.Bold,
-                            )
-                            Spacer(Modifier.width(6.dp))
-                            Text(
-                                "· ${era.desc}",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = OnSurfaceLow,
-                            )
-                            Spacer(Modifier.weight(1f))
-                            Text(
-                                "${items.size}",
-                                style = MaterialTheme.typography.labelLarge,
-                                color = OnSurfaceLow,
-                            )
-                        }
-                        Spacer(Modifier.height(6.dp))
-                        items.forEach { v ->
-                            val isSelected = v.packFormat == currentVersion
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clip(RoundedCornerShape(12.dp))
-                                    .background(
-                                        if (isSelected) BlueAccent.copy(alpha = 0.12f)
-                                        else OnSurfaceLow.copy(alpha = 0.04f)
-                                    )
-                                    .clickable { onVersionChange(v.packFormat) }
-                                    .padding(horizontal = 12.dp, vertical = 10.dp),
-                            ) {
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Row(verticalAlignment = Alignment.CenterVertically) {
-                                        Text(
-                                            v.label,
-                                            style = MaterialTheme.typography.titleMedium,
-                                            color = if (isSelected) BlueAccent else OnSurfaceHigh,
-                                            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.SemiBold,
-                                        )
-                                        v.status?.let { s ->
-                                            Spacer(Modifier.width(6.dp))
-                                            StatusBadge(s)
-                                        }
-                                    }
-                                    Text(
-                                        v.range,
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = OnSurfaceLow,
-                                    )
-                                }
-                                Spacer(Modifier.width(8.dp))
-                                Text(
-                                    "pack_format ${v.packFormat}",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = if (isSelected) BlueAccent else OnSurfaceLow,
-                                    fontWeight = FontWeight.Medium,
-                                )
-                                if (isSelected) {
-                                    Spacer(Modifier.width(8.dp))
-                                    Icon(
-                                        Icons.Filled.Check,
-                                        contentDescription = null,
-                                        tint = BlueAccent,
-                                        modifier = Modifier.size(18.dp),
-                                    )
-                                }
-                            }
-                            Spacer(Modifier.height(6.dp))
-                        }
-                        Spacer(Modifier.height(4.dp))
-                    }
-                }
-
-                // ── 选择即警示（非阻塞，S2）──
-                if (AppSettings.hasKnownIssue(currentVersion)) {
-                    WarningCard(
-                        title = Texts.java263WarnTitle,
-                        body = Texts.java263WarnBody,
-                        accent = AmberNotice,
-                    )
-                }
-                if (AppSettings.isBedrock(currentVersion)) {
-                    WarningCard(
-                        title = Texts.bedrockWarnTitle,
-                        body = Texts.bedrockWarnBody,
-                        accent = AmberNotice,
-                    )
-                }
-
-                Spacer(Modifier.height(8.dp))
-                HorizontalDivider(color = OnSurfaceLow.copy(alpha = 0.15f))
-                Spacer(Modifier.height(8.dp))
-
-                // ── 转换选项区（7 个开关中 fix_alpha_layers 不暴露）──
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        Texts.optionsTitle,
-                        style = MaterialTheme.typography.titleMedium,
-                        color = OnSurfaceHigh,
-                        fontWeight = FontWeight.SemiBold,
-                    )
+                    Text(era.label, style = AppText.itemTitle.copy(fontWeight = FontWeight.Medium), color = c.ink2)
+                    Spacer(Modifier.width(6.dp))
+                    Text("· ${era.desc}", style = AppText.tagline, color = c.ink4)
                     Spacer(Modifier.weight(1f))
-                    TextButton(onClick = { SettingsRepository.resetConversionOptions() }) {
-                        Text(Texts.optionsReset, color = BlueAccent, style = MaterialTheme.typography.labelLarge)
-                    }
+                    Text("${eraItems.size}", style = AppText.numeric, color = c.ink4)
                 }
-                Text(
-                    Texts.optionsHint,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = OnSurfaceLow,
-                )
-                Spacer(Modifier.height(4.dp))
+                eraItems.forEach { v ->
+                    VersionPickRow(
+                        entry = v,
+                        selected = v.packFormat == currentVersion,
+                        onClick = { onVersionChange(v.packFormat) },
+                    )
+                }
+            }
+        }
 
-                ConversionOptionsSection(
-                    options = options,
-                    namingPreset = namingPreset,
-                    onDangerRequest = { kind -> pendingDanger = kind },
-                )
-            }
-        },
-        confirmButton = {
-            TextButton(onClick = onConfirm) {
-                Text(Texts.startConvert, color = BlueAccent, fontWeight = FontWeight.SemiBold)
-            }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) { Text(Texts.cancel) }
-        },
-        containerColor = MaterialTheme.colorScheme.surface,
-    )
+        // 选择即警示（非阻塞）：26.3 已知问题 / Bedrock 实验性，用 warn 色不用红色
+        if (AppSettings.hasKnownIssue(currentVersion)) {
+            WarnBanner(title = Texts.java263WarnTitle, body = Texts.java263WarnBody)
+        }
+        if (AppSettings.isBedrock(currentVersion)) {
+            WarnBanner(title = Texts.bedrockWarnTitle, body = Texts.bedrockWarnBody)
+        }
+
+        HairlineDivider(modifier = Modifier.padding(top = 8.dp))
+
+        // 转换选项区
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(Texts.optionsTitle, style = AppText.itemTitle, color = c.ink)
+            Spacer(Modifier.weight(1f))
+            DialogTextButton(
+                text = Texts.optionsReset,
+                onClick = { SettingsRepository.resetConversionOptions() },
+                tone = DialogButtonTone.QUIET,
+            )
+        }
+        Text(Texts.optionsHint, style = AppText.tagline, color = c.ink3)
+
+        ConversionOptionsSection(
+            options = options,
+            namingPreset = namingPreset,
+            onDangerRequest = { kind -> pendingDanger = kind },
+        )
+    }
 
     // 危险开关的二次确认
     pendingDanger?.let { kind ->
-        DangerConfirmDialog(
-            kind = kind,
+        val title: String
+        val body: String
+        when (kind) {
+            DangerKind.DELETE_SHADERS -> {
+                title = Texts.deleteShadersConfirmTitle
+                body = Texts.deleteShadersConfirmBody
+            }
+            DangerKind.DELETE_CIT -> {
+                title = Texts.deleteCitConfirmTitle
+                body = Texts.deleteCitConfirmBody
+            }
+        }
+        BrandConfirmDialog(
+            title = title,
+            body = body,
+            confirmLabel = Texts.confirmEnable,
             onConfirm = {
                 when (kind) {
                     DangerKind.DELETE_SHADERS -> SettingsRepository.setDeleteShaders(true)
@@ -766,13 +575,70 @@ private fun ConvertVersionDialog(
     }
 }
 
-/** 转换选项列表（转换对话框内使用；设置页显示摘要，不重复渲染）。 */
+@Composable
+private fun VersionPickRow(
+    entry: AppSettings.VersionEntry,
+    selected: Boolean,
+    onClick: () -> Unit,
+) {
+    val c = Paper.colors
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(TwoFAShapes.row)
+            .background(if (selected) c.hover else Color.Transparent)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 10.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    entry.label,
+                    style = AppText.itemTitle.copy(
+                        fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
+                    ),
+                    color = if (selected) c.accent else c.ink,
+                )
+                entry.status?.let { status ->
+                    Spacer(Modifier.width(6.dp))
+                    VersionStatusBadge(status)
+                }
+            }
+            Text(entry.range, style = AppText.tagline, color = c.ink3)
+        }
+        Text(
+            "pack_format ${entry.packFormat}",
+            style = AppText.tagline.copy(fontFeatureSettings = "tnum"),
+            color = c.ink4,
+        )
+        if (selected) {
+            Spacer(Modifier.width(6.dp))
+            Icon(Icons.Filled.Check, contentDescription = null, tint = c.accent, modifier = Modifier.size(16.dp))
+        }
+    }
+}
+
+// 版本状态徽章：latest → accent；stable → ok；recommended → warn；beta → ink3（不用蓝）。
+@Composable
+private fun VersionStatusBadge(status: AppSettings.VersionStatus) {
+    val tone = when (status) {
+        AppSettings.VersionStatus.LATEST -> StatusTone.ACCENT
+        AppSettings.VersionStatus.STABLE -> StatusTone.OK
+        AppSettings.VersionStatus.RECOMMENDED -> StatusTone.WARN
+        AppSettings.VersionStatus.BETA -> StatusTone.INK
+    }
+    StatusBadge(label = status.label, tone = tone)
+}
+
 @Composable
 private fun ConversionOptionsSection(
     options: ConvertOptions,
     namingPreset: NamingPreset,
     onDangerRequest: (DangerKind) -> Unit,
 ) {
+    val c = Paper.colors
+
     // adapt_shaders：默认 true，实验功能
     ConversionSwitchRow(
         label = Texts.adaptShadersLabel,
@@ -780,15 +646,14 @@ private fun ConversionOptionsSection(
         checked = options.adaptShaders,
         onCheckedChange = { SettingsRepository.setAdaptShaders(it) },
     )
-    // delete_shaders：破坏性，默认 false，红色标记 + 二次确认
+    // delete_shaders：破坏性，默认 false，danger 标记 + 二次确认
     ConversionSwitchRow(
         label = Texts.deleteShadersLabel,
         hint = Texts.deleteShadersHint,
         checked = options.deleteShaders,
         destructive = true,
         onCheckedChange = { enabled ->
-            if (enabled) onDangerRequest(DangerKind.DELETE_SHADERS)
-            else SettingsRepository.setDeleteShaders(false)
+            if (enabled) onDangerRequest(DangerKind.DELETE_SHADERS) else SettingsRepository.setDeleteShaders(false)
         },
     )
     // convert_item_definitions：默认 true
@@ -813,8 +678,7 @@ private fun ConversionOptionsSection(
         checked = options.deleteCit,
         destructive = true,
         onCheckedChange = { enabled ->
-            if (enabled) onDangerRequest(DangerKind.DELETE_CIT)
-            else SettingsRepository.setDeleteCit(false)
+            if (enabled) onDangerRequest(DangerKind.DELETE_CIT) else SettingsRepository.setDeleteCit(false)
         },
     )
     // write_gen_metadata：默认 true（仅 Java 目标写 2pyr-gen.json）
@@ -825,53 +689,35 @@ private fun ConversionOptionsSection(
         onCheckedChange = { SettingsRepository.setWriteGenMetadata(it) },
     )
 
-    Spacer(Modifier.height(10.dp))
-    // 命名模板预设
-    Text(
-        Texts.namingTitle,
-        style = MaterialTheme.typography.titleMedium,
-        color = OnSurfaceHigh,
-        fontWeight = FontWeight.SemiBold,
-    )
-    Text(
-        Texts.namingHint,
-        style = MaterialTheme.typography.bodySmall,
-        color = OnSurfaceLow,
-    )
+    Spacer(Modifier.height(6.dp))
+    Text(Texts.namingTitle, style = AppText.itemTitle, color = c.ink)
+    Text(Texts.namingHint, style = AppText.tagline, color = c.ink3)
     Spacer(Modifier.height(6.dp))
     Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .horizontalScroll(rememberScrollState()),
+        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
         horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         NamingPreset.entries.forEach { preset ->
             val active = preset == namingPreset
             Box(
                 modifier = Modifier
-                    .clip(RoundedCornerShape(999.dp))
-                    .background(
-                        if (active) BlueAccent.copy(alpha = 0.14f)
-                        else OnSurfaceLow.copy(alpha = 0.06f)
-                    )
+                    .clip(TwoFAShapes.row)
+                    .background(if (active) c.accent.copy(alpha = 0.12f) else c.surface3)
                     .clickable { SettingsRepository.setNamingPreset(preset) }
-                    .padding(horizontal = 12.dp, vertical = 6.dp),
+                    .padding(horizontal = 10.dp, vertical = 5.dp),
             ) {
                 Text(
                     preset.label,
-                    style = MaterialTheme.typography.labelLarge,
-                    color = if (active) BlueAccent else OnSurfaceLow,
-                    fontWeight = if (active) FontWeight.SemiBold else FontWeight.Medium,
+                    style = AppText.tagline.copy(
+                        fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
+                    ),
+                    color = if (active) c.accent else c.ink3,
                 )
             }
         }
     }
     Spacer(Modifier.height(4.dp))
-    Text(
-        namingPreset.desc,
-        style = MaterialTheme.typography.bodySmall,
-        color = OnSurfaceLow,
-    )
+    Text(namingPreset.desc, style = AppText.tagline, color = c.ink4)
 }
 
 @Composable
@@ -883,148 +729,54 @@ private fun ConversionSwitchRow(
     enabled: Boolean = true,
     onCheckedChange: (Boolean) -> Unit,
 ) {
-    Column(modifier = Modifier.fillMaxWidth().padding(vertical = 5.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Column(modifier = Modifier.weight(1f)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        label,
-                        style = MaterialTheme.typography.bodyLarge,
-                        color = OnSurfaceHigh,
-                        fontWeight = FontWeight.Medium,
-                    )
-                    if (destructive) {
-                        Spacer(Modifier.width(6.dp))
-                        DangerTag()
-                    }
-                }
-                Text(
-                    hint,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = OnSurfaceLow,
-                )
-            }
-            Spacer(Modifier.width(8.dp))
-            Switch(
-                checked = checked,
-                enabled = enabled,
-                onCheckedChange = onCheckedChange,
-                colors = if (destructive) {
-                    SwitchDefaults.colors(checkedTrackColor = CrimsonWarn)
-                } else {
-                    SwitchDefaults.colors()
-                },
-            )
-        }
-    }
-}
-
-@Composable
-private fun DangerTag() {
-    Box(
-        modifier = Modifier
-            .clip(RoundedCornerShape(6.dp))
-            .background(CrimsonWarn.copy(alpha = 0.14f))
-            .padding(horizontal = 6.dp, vertical = 1.dp),
-    ) {
-        Text(
-            Texts.dangerTag,
-            style = MaterialTheme.typography.labelSmall,
-            color = CrimsonWarn,
-            fontWeight = FontWeight.SemiBold,
-        )
-    }
-}
-
-@Composable
-private fun WarningCard(title: String, body: String, accent: Color) {
+    val c = Paper.colors
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(vertical = 8.dp)
-            .clip(RoundedCornerShape(12.dp))
-            .background(accent.copy(alpha = 0.10f))
-            .padding(horizontal = 12.dp, vertical = 10.dp),
+            .padding(vertical = 5.dp),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
-        Icon(
-            Icons.Filled.Warning,
-            contentDescription = null,
-            tint = accent,
-            modifier = Modifier.size(18.dp),
-        )
-        Spacer(Modifier.width(8.dp))
-        Column {
-            Text(
-                title,
-                style = MaterialTheme.typography.labelLarge,
-                color = accent,
-                fontWeight = FontWeight.Bold,
-            )
+        Column(modifier = Modifier.weight(1f)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    label,
+                    style = AppText.body.copy(fontWeight = FontWeight.Medium),
+                    color = if (destructive) c.danger else c.ink,
+                )
+                if (destructive) {
+                    Spacer(Modifier.width(6.dp))
+                    DangerTag(Texts.dangerTag)
+                }
+            }
             Spacer(Modifier.height(2.dp))
             Text(
-                body,
-                style = MaterialTheme.typography.bodySmall,
-                color = OnSurfaceLow,
+                hint,
+                style = AppText.tagline,
+                color = if (enabled) c.ink3 else c.ink4,
             )
         }
-    }
-}
-
-@Composable
-private fun DangerConfirmDialog(
-    kind: DangerKind,
-    onConfirm: () -> Unit,
-    onDismiss: () -> Unit,
-) {
-    val title: String
-    val body: String
-    when (kind) {
-        DangerKind.DELETE_SHADERS -> {
-            title = Texts.deleteShadersConfirmTitle
-            body = Texts.deleteShadersConfirmBody
-        }
-        DangerKind.DELETE_CIT -> {
-            title = Texts.deleteCitConfirmTitle
-            body = Texts.deleteCitConfirmBody
-        }
-    }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text(title) },
-        text = { Text(body, color = OnSurfaceLow) },
-        confirmButton = {
-            TextButton(onClick = onConfirm) {
-                Text(Texts.confirmEnable, color = CrimsonWarn, fontWeight = FontWeight.SemiBold)
-            }
-        },
-        dismissButton = { TextButton(onClick = onDismiss) { Text(Texts.cancel) } },
-        containerColor = MaterialTheme.colorScheme.surface,
-    )
-}
-
-@Composable
-private fun StatusBadge(status: AppSettings.VersionStatus) {
-    val (bg, fg) = when (status) {
-        AppSettings.VersionStatus.STABLE ->
-            Color(0xFF14532D) to Color(0xFFA8FFB0)  // 绿
-        AppSettings.VersionStatus.LATEST ->
-            BlueAccent to Color.White  // 蓝
-        AppSettings.VersionStatus.RECOMMENDED ->
-            Color(0xFFB45309) to Color(0xFFFEF3C7)  // 琥珀
-        AppSettings.VersionStatus.BETA ->
-            Color(0xFF4C1D95) to Color(0xFFE9D5FF)  // 紫
-    }
-    Box(
-        modifier = Modifier
-            .clip(RoundedCornerShape(6.dp))
-            .background(bg.copy(alpha = 0.18f))
-            .padding(horizontal = 6.dp, vertical = 1.dp),
-    ) {
-        Text(
-            status.label,
-            style = MaterialTheme.typography.labelSmall,
-            color = fg,
-            fontWeight = FontWeight.SemiBold,
+        Spacer(Modifier.width(10.dp))
+        Switch(
+            checked = checked,
+            enabled = enabled,
+            onCheckedChange = onCheckedChange,
+            colors = if (destructive) {
+                SwitchDefaults.colors(
+                    checkedThumbColor = Color.White,
+                    checkedTrackColor = c.danger,
+                    uncheckedThumbColor = c.ink4,
+                    uncheckedTrackColor = c.surface5,
+                    uncheckedBorderColor = c.hairlineStrong,
+                )
+            } else {
+                SwitchDefaults.colors(
+                    checkedThumbColor = c.onAccent,
+                    checkedTrackColor = c.accent,
+                    uncheckedThumbColor = c.ink4,
+                    uncheckedTrackColor = c.surface5,
+                    uncheckedBorderColor = c.hairlineStrong,
+                )
+            },
         )
     }
 }
@@ -1036,55 +788,51 @@ private fun ConvertDetailSheet(
     onRemove: () -> Unit,
     onRetry: () -> Unit,
 ) {
+    val c = Paper.colors
     val clipboardManager = LocalClipboardManager.current
     var notesExpanded by remember(item.id) { mutableStateOf(false) }
 
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .verticalScroll(rememberScrollState())
-            .padding(horizontal = 24.dp, vertical = 8.dp)
-            .padding(bottom = 32.dp),
-    ) {
-        Text(
-            item.fileName,
-            style = MaterialTheme.typography.headlineSmall,
-            color = OnSurfaceHigh,
-            fontWeight = FontWeight.SemiBold,
-        )
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Text(item.fileName, style = AppText.sectionTitle, color = c.ink)
         Spacer(Modifier.height(8.dp))
-        Text(
-            "目标版本：${AppSettings.versionLabel(item.targetVersion)}",
-            style = MaterialTheme.typography.bodyMedium,
-            color = OnSurfaceLow,
-        )
-        Spacer(Modifier.height(4.dp))
-        Text(
-            item.status.label,
-            style = MaterialTheme.typography.bodyMedium,
-            color = OnSurfaceLow,
-        )
-        Spacer(Modifier.height(20.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            VersionChip("→ ${AppSettings.versionLabel(item.targetVersion)}")
+            Spacer(Modifier.width(8.dp))
+            StatusBadge(
+                label = when (item.status) {
+                    is QueueItem.Status.Done -> "完成"
+                    is QueueItem.Status.Failed -> "失败"
+                    is QueueItem.Status.Running -> "转换中"
+                    is QueueItem.Status.Queued -> "排队中"
+                },
+                tone = when (item.status) {
+                    is QueueItem.Status.Done -> StatusTone.OK
+                    is QueueItem.Status.Failed -> StatusTone.DANGER
+                    is QueueItem.Status.Running -> StatusTone.ACCENT
+                    is QueueItem.Status.Queued -> StatusTone.INK
+                },
+            )
+        }
+        Spacer(Modifier.height(16.dp))
 
         when (val s = item.status) {
             is QueueItem.Status.Done -> {
-                // 结果区（4b 真数据；4a 阶段 sourceVersion/skipped/notes 为 DTO 默认值）
                 if (s.sourceVersion > 0) {
-                    SheetInfoLine(
-                        "版本",
-                        "${AppSettings.versionShort(s.sourceVersion)} → " +
+                    InfoLine(
+                        label = "版本",
+                        value = "${AppSettings.versionShort(s.sourceVersion)} → " +
                             AppSettings.versionShort(item.targetVersion),
                     )
                     Spacer(Modifier.height(10.dp))
                 }
-                SheetInfoLine("输出路径", s.outputPath)
+                InfoLine(label = "输出路径", value = s.outputPath)
                 if (s.elapsedMs > 0) {
                     Spacer(Modifier.height(10.dp))
-                    SheetInfoLine("耗时", formatElapsed(s.elapsedMs))
+                    InfoLine(label = "耗时", value = formatElapsed(s.elapsedMs))
                 }
                 if (s.skipped > 0) {
                     Spacer(Modifier.height(10.dp))
-                    SheetInfoLine("跳过的任务数", "${s.skipped}")
+                    InfoLine(label = "跳过的任务数", value = "${s.skipped}")
                 }
                 if (s.notes.isNotEmpty()) {
                     Spacer(Modifier.height(12.dp))
@@ -1094,9 +842,14 @@ private fun ConvertDetailSheet(
                         onToggle = { notesExpanded = !notesExpanded },
                     )
                 }
-                Spacer(Modifier.height(16.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    SecondaryActionButton(text = "移除", onClick = onRemove)
+                Spacer(Modifier.height(18.dp))
+                HairlineDivider()
+                Spacer(Modifier.height(14.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
+                ) {
+                    SecondaryActionButton(text = "移除", onClick = onRemove, height = 32.dp)
                     PrimaryActionButton(
                         text = "复制路径",
                         onClick = {
@@ -1104,83 +857,78 @@ private fun ConvertDetailSheet(
                                 clipboardManager.setText(AnnotatedString(s.outputPath))
                             }
                         },
+                        height = 32.dp,
                     )
                 }
             }
             is QueueItem.Status.Failed -> {
-                SheetInfoLine("失败原因", s.reason)
-                Spacer(Modifier.height(16.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    SecondaryActionButton(text = "移除", onClick = onRemove)
-                    PrimaryActionButton(text = "重新转换", onClick = onRetry)
+                InfoLine(label = "失败原因", value = s.reason)
+                Spacer(Modifier.height(18.dp))
+                HairlineDivider()
+                Spacer(Modifier.height(14.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
+                ) {
+                    SecondaryActionButton(text = "移除", onClick = onRemove, height = 32.dp)
+                    PrimaryActionButton(text = "重新转换", onClick = onRetry, height = 32.dp)
                 }
             }
             is QueueItem.Status.Running -> {
                 val percent = progress?.percent ?: 0f
-                Spacer(Modifier.height(4.dp))
                 LinearProgressIndicator(
                     progress = { percent },
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(4.dp)
-                        .clip(RoundedCornerShape(2.dp)),
-                    color = BlueAccent,
-                    trackColor = MaterialTheme.colorScheme.surfaceVariant,
+                        .clip(TwoFAShapes.row),
+                    color = c.accent,
+                    trackColor = c.surface3,
                 )
                 Spacer(Modifier.height(8.dp))
                 Text(
                     Texts.progressLine(progress?.phase, percent),
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = OnSurfaceLow,
+                    style = AppText.body.copy(fontFeatureSettings = "tnum"),
+                    color = c.ink3,
                 )
             }
             is QueueItem.Status.Queued -> {
-                Spacer(Modifier.height(16.dp))
-                PrimaryActionButton(text = "开始转换", onClick = onRetry)
+                Spacer(Modifier.height(4.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
+                ) {
+                    PrimaryActionButton(text = "开始转换", onClick = onRetry, height = 32.dp)
+                }
             }
         }
     }
 }
 
-/**
- * 引擎备注（notes）：**既有跳过原因也有普通进展**（如"写出 12 个物品定义"），
- * 所以标题用「引擎备注」而不是「跳过原因」（S17 的语义要求）。
- */
+// 引擎备注（notes）：既有跳过原因也有普通进展（如「写出 12 个物品定义」），
+// 所以标题用「引擎备注」而不是「跳过原因」。
 @Composable
 private fun NotesSection(notes: List<String>, expanded: Boolean, onToggle: () -> Unit) {
+    val c = Paper.colors
     Column {
-        Text(
-            "引擎备注（含跳过原因与普通进展）",
-            style = MaterialTheme.typography.labelLarge,
-            color = OnSurfaceLow,
-        )
+        Text("引擎备注（含跳过原因与普通进展）", style = AppText.tagline, color = c.ink3)
         Spacer(Modifier.height(4.dp))
         val visible = if (expanded) notes else notes.take(3)
         visible.forEach { note ->
-            Text(
-                "· $note",
-                style = MaterialTheme.typography.bodySmall,
-                color = OnSurfaceLow,
-            )
+            Text("· $note", style = AppText.tagline, color = c.ink2)
         }
         if (notes.size > 3) {
-            TextButton(onClick = onToggle) {
-                Text(
-                    if (expanded) "收起" else "展开全部（${notes.size} 条）",
-                    color = BlueAccent,
-                    style = MaterialTheme.typography.labelLarge,
-                )
-            }
+            Spacer(Modifier.height(4.dp))
+            Text(
+                text = if (expanded) "收起" else "展开全部（${notes.size} 条）",
+                style = AppText.tagline.copy(fontWeight = FontWeight.Medium),
+                color = c.accent,
+                modifier = Modifier
+                    .clip(TwoFAShapes.row)
+                    .clickable(onClick = onToggle)
+                    .padding(horizontal = 4.dp, vertical = 2.dp),
+            )
         }
-    }
-}
-
-@Composable
-private fun SheetInfoLine(label: String, value: String) {
-    Column {
-        Text(label, style = MaterialTheme.typography.labelLarge, color = OnSurfaceLow)
-        Spacer(Modifier.height(4.dp))
-        Text(value, style = MaterialTheme.typography.bodyMedium, color = OnSurfaceHigh)
     }
 }
 
