@@ -226,7 +226,7 @@ jobs:
         working-directory: 2fa-android
         env:
           GRADLE_OPTS: "-Dorg.gradle.daemon=false"
-        run: ./gradlew :app:assembleRelease --no-daemon --stacktrace
+        run: bash ./gradlew :app:assembleRelease --no-daemon --stacktrace
 
       # ── [9] 重命名 + 计算 SHA-256 ──────────────────────────────────
       # 资产名带版本号（不是 versionCode），用户下载后能直接看出是哪个版本；

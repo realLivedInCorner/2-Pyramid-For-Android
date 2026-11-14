@@ -42,6 +42,8 @@ Thumbs.db
 *.dex
 *.class
 *.jar
+# Gradle wrapper jar 必须入库：CI 没有系统 Gradle，gradlew 依赖它启动
+!2fa-android/gradle/wrapper/gradle-wrapper.jar
 
 # ── Logs / temp ────────────────────────────────────────────
 *.log

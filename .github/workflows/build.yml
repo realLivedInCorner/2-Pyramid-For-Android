@@ -146,7 +146,7 @@ jobs:
         env:
           # 关掉 Gradle 的更新检查,加速
           GRADLE_OPTS: "-Dorg.gradle.daemon=false"
-        run: ./gradlew :app:assembleDebug --no-daemon --stacktrace
+        run: bash ./gradlew :app:assembleDebug --no-daemon --stacktrace
 
       # ── [9] 上传 APK 作为 artifact ───────────────────────────
       - name: Upload debug APK

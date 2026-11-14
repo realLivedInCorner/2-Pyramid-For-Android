@@ -1,0 +1,5 @@
+# 行尾约定（跨平台 CI 必需）
+# Windows 上 checkout 默认 CRLF；ubuntu runner 执行 `./gradlew`/`.sh` 时，
+# CRLF 会让 sh 的 shebang 变成 "sh\r" 并报 exit 127。这几个文件固定 LF。
+2fa-android/gradlew text eol=lf
+*.sh text eol=lf
