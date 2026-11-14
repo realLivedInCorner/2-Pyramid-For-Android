@@ -50,22 +50,30 @@ val androidNdkDir: File? = run {
     ndkParent?.listFiles()?.filter { it.isDirectory }?.maxByOrNull { it.name }
 }
 
-// ── 自动 versionCode +1（每次 build 跑过就 +1，不用手动改）─────────────
-// version.properties 在 2fa-android/ 根目录，存 VERSION_CODE。
-// 第一次跑：读 0 → +1 → 写 1。
-// 第 N 次：读 N-1 → +1 → 写 N。
-// versionName 固定为正式版 2.1.0（versionCode 仍自动 +1）
-val versionPropsFile = rootProject.file("version.properties")
-val versionProps = Properties().apply {
-    if (versionPropsFile.exists()) {
-        versionPropsFile.inputStream().use { load(it) }
+// ── 版本号：versionCode 从仓库根 `BUILD` 读取（构建只读，不写回）──────────
+// 与桌面主仓库（2-Pyramid）同一套规则：BUILD 是**提交里的固定值**，构建只读不写。
+// 发布前显式改（`python tools/set_version.py --set X.Y.Z --build N`），这样 CI 出的
+// APK 与本地出的 APK 编号一致 —— 它们是同一个版本的两半，编号不同就无法回答
+// 「这个 APK 对应哪次构建」。
+//
+// v2.1.0 起删除旧的 `version.properties` 自动 +1 机制：以前每次构建都会在配置期
+// 改写 version.properties，同一版本在 CI 与本地会得到不同编号。
+//
+// versionName 由 `tools/set_version.py --set` 同步（也是 release tag 的校验目标）；
+// 这里保留字面量，让脚本能稳定定位。
+val buildFile = rootProject.file("../BUILD")
+val buildNumber: Int = run {
+    if (!buildFile.isFile) {
+        error(
+            "[2FA] 找不到仓库根 BUILD 文件：${buildFile.absolutePath}\n" +
+                "      versionCode 从 BUILD 读取（内容为整数构建号，如 21000），请先创建它。"
+        )
     }
+    val raw = buildFile.readText(Charsets.UTF_8).trim()
+    raw.toIntOrNull()
+        ?: error("[2FA] BUILD 内容不是整数：'$raw'（${buildFile.absolutePath}）")
 }
-val baseVersionCode: Int = versionProps.getProperty("VERSION_CODE")?.toIntOrNull() ?: 0
-val newVersionCode: Int = baseVersionCode + 1
-versionProps.setProperty("VERSION_CODE", newVersionCode.toString())
-versionPropsFile.outputStream().use { versionProps.store(it, "auto-bumped by gradle build") }
-logger.lifecycle("[2FA] versionCode -> $newVersionCode")
+logger.lifecycle("[2FA] versionCode = $buildNumber（from BUILD）")
 
 android {
     namespace = "com.twopyramid.twofa"
@@ -75,24 +83,41 @@ android {
         applicationId = "com.twopyramid.twofa"
         minSdk = 31
         targetSdk = 37
-        versionCode = newVersionCode
+        // 构建号来自仓库根 BUILD（见文件顶部）；发布前显式递增，不在构建时自增。
+        versionCode = buildNumber
+        // 版本号唯一事实来源：本行 + README 徽章 + docs/compose/releases/news-<ver>.md，
+        // 三者由 `python tools/set_version.py --check` 校验、`--set` 同步。
         versionName = "2.1.0"
+        // BUILD 同时暴露给 Compose（设置 → 关于显示 `BuildConfig.BUILD_NUMBER`）；
+        // `BuildConfig.VERSION_NAME` / `VERSION_CODE` 由 AGP 按上面的字段自动生成，无需重复声明。
+        buildConfigField("int", "BUILD_NUMBER", buildNumber.toString())
 
         ndk {
             abiFilters += abiList
         }
     }
 
-    // ── 签名：用 Android SDK 默认 debug keystore（用户主目录 ~/.android/debug.keystore）──
-    // 用户的设备上 install release build 不需要先卸载 debug，因为 debug 和 release 都用同一个
-    // debug.keystore 签，签名相同才能覆盖安装。
+    // ── 签名：发行用**仓库内公开的 debug keystore**，本地回退用户目录的 debug keystore ──
+    // 主仓库（桌面版）的发行是官方签名；Android 侧目前仍是**调试级签名**：密钥文件
+    // `tools/ci/debug.keystore` 随仓库公开（alias/password 均为 Android 标准 debug 值），
+    // CI 与本地构建共用同一把密钥 → 跨版本签名稳定，用户可覆盖安装升级。
+    // 它**不是** Google Play / 商店发行密钥，任何人都能重签；完整性以 Release 附带的
+    // `.apk.sha256` 为准（见 legal/SECURITY.md）。旧版本（2.0.0 及更早）用各机器自己的
+    // `~/.android/debug.keystore` 签名，升级到 2.1.0 可能需要先卸载一次。
     signingConfigs {
-        create("releaseWithDebugKey") {
-            val debugKeystore = file("${System.getProperty("user.home")}/.android/debug.keystore")
-            storeFile = debugKeystore
-            storePassword = "android"
-            keyAlias = "androiddebugkey"
-            keyPassword = "android"
+        create("release") {
+            val projectKeystore = rootProject.file("../tools/ci/debug.keystore")
+            if (projectKeystore.isFile) {
+                storeFile = projectKeystore
+                storePassword = "android"
+                keyAlias = "androiddebugkey"
+                keyPassword = "android"
+            } else {
+                storeFile = file("${System.getProperty("user.home")}/.android/debug.keystore")
+                storePassword = "android"
+                keyAlias = "androiddebugkey"
+                keyPassword = "android"
+            }
         }
     }
 
@@ -102,7 +127,7 @@ android {
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-            signingConfig = signingConfigs.getByName("releaseWithDebugKey")
+            signingConfig = signingConfigs.getByName("release")
         }
         debug {
             isDebuggable = true

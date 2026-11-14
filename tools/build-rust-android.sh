@@ -118,11 +118,16 @@ if [[ -d "$BINDING_DIR/uniffi" ]]; then
   rm -rf "$BINDING_DIR/uniffi"
 fi
 mkdir -p "$BINDING_DIR"
+# 重要:uniffi-bindgen 0.32 即使 `--library` 模式也会跑 `cargo metadata`,
+# 因此必须在 crate 目录内调用；在仓库根 cwd 调用会因找不到 Cargo.toml 失败
+# （与本地 tools/build-rust-android.bat 的修复同因，见 _sync/reports 构建记录）。
+pushd "$RUST_CRATE_DIR" >/dev/null
 uniffi-bindgen generate \
   --library "$SO_OUT" \
   --language kotlin \
   --out-dir "$BINDING_DIR" \
   --crate convert_core
+popd >/dev/null
 echo "       binding: $BINDING_DIR"
 
 # ── [5] Done ──────────────────────────────────────────────────

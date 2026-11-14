@@ -4,15 +4,18 @@
 # 触发:
 #   - pull_request  → 任何对 main 的 PR
 #   - push to main  → merge 后
+#   - workflow_dispatch → 手动验证
 #
 # 行为:
-#   1. 装 Rust toolchain + Android SDK + NDK 27
-#   2. 跑 cargo 编译 + UniFFI binding 生成
-#   3. 跑 ./gradlew :app:assembleDebug
-#   4. 上传 APK 作为 artifact(只保留 7 天)
+#   1. 版本一致性自检（tools/set_version.py --check，无 tag 时不做 tag 对齐）
+#   2. 装 Rust toolchain + Android SDK + NDK
+#   3. 跑 cargo 编译 + UniFFI binding 生成（tools/build-rust-android.sh）
+#   4. 跑 ./gradlew :app:assembleDebug
+#   5. 上传 APK 作为 artifact(只保留 7 天)
 #
 # 不上传 release(那是 release.yml 的活)。
 # 不签名 release build(避免和 release workflow 串号,以及 PR 不应该有 release 权限)。
+# BUILD 只读：versionCode 来自仓库根 BUILD，构建不写回任何版本文件。
 # ===============================================================
 
 name: build
@@ -51,7 +54,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── [2] 工具链:Rust + Android SDK + JDK ──────────────────
+      # ── [2] 版本一致性自检 ──────────────────────────────────
+      # PR/main 上没有发布 tag（GITHUB_REF_NAME 是 `123/merge` 或 `main`），
+      # 脚本会跳过 tag 对齐，只校验 versionName / BUILD / versionCode 读取 /
+      # README 徽章 / news 文件的一致性 —— 版本号漏改在这里就能拦住。
+      - name: Check version consistency
+        run: python3 tools/set_version.py --check
+
+      # ── [3] 工具链:Rust + Android SDK + JDK ──────────────────
       - name: Install Rust toolchain (stable)
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -78,26 +88,27 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Set up Android SDK (NDK 27 + platform 36)
+      # NDK/平台必须与 2fa-android/gradle.properties 的 android.ndkVersion（27.3.13750724）
+      # 和 compileSdk（37）一致；android-actions/setup-android@v3 **没有** ndk-version /
+      # sdk-version 输入（会被忽略），NDK 与平台都必须写进 `packages` 交给 sdkmanager 安装。
+      # `platforms;android-37.0` 是 sdkmanager 的真实包 id（本地 package.xml 同口径）。
+      - name: Set up Android SDK (NDK 27.3 + platform 37)
         uses: android-actions/setup-android@v3
         with:
-          # 项目 gradle.properties 指定 android.ndkVersion=27.2.12479018
-          # platform-tools / platforms;android-36 / build-tools;36.0.0 由 build 自动取最新
-          ndk-version: 27.2.12479018
-          sdk-version: 37
           packages: |
             platform-tools
-            platforms;android-36
-            build-tools;36.0.0
+            platforms;android-37.0
+            build-tools;37.0.0
+            ndk;27.3.13750724
 
-      # ── [3] 装 Gradle 缓存 helper ─────────────────────────────
+      # ── [4] 装 Gradle 缓存 helper ─────────────────────────────
       - name: Setup Gradle (with build cache)
         uses: gradle/actions/setup-gradle@v4
         with:
           cache-disabled: false
           gradle-home-cache-cleanup: true
 
-      # ── [4] 抽 JNA libjnidispatch.so 到 jniLibs ──────────────
+      # ── [5] 抽 JNA libjnidispatch.so 到 jniLibs ──────────────
       # 项目 libs.versions.toml 注:jna jar 不含 android natives,
       # 需要从 jna-platform aar 抽 libjnidispatch.so 到 jniLibs/<abi>/。
       # CI 必做(本地用户也手动从 jar 抽,gitignore 整个 jniLibs 目录)。
@@ -119,24 +130,17 @@ jobs:
           ls -la "$JNI_LIBS"
           echo "libjnidispatch.so extracted OK"
 
-      # ── [5] 编译 Rust + UniFFI binding ───────────────────────
+      # ── [6] 把 BUILD 传给 Rust 编译 ──────────────────────────
+      # convert-core/build.rs 的 BUILD_NUMBER 默认 21000；这里用仓库 BUILD 覆盖，
+      # 让测试与产物里的构建号与 versionCode 同源（与 release.yml 一致）。
+      - name: Export BUILD_NUMBER for the Rust build
+        run: echo "BUILD_NUMBER=$(tr -d '[:space:]' < BUILD)" >> "$GITHUB_ENV"
+
+      # ── [7] 编译 Rust + UniFFI binding ───────────────────────
       - name: Build convert-core (Rust → .so + Kotlin binding)
         run: bash tools/build-rust-android.sh arm64-v8a
 
-      # ── [6] 校验:GitHub Actions 禁止直接 commit 上去污染 ──
-      # version.properties 会被 Gradle 自动 +1,我们故意不 commit 回去:
-      #   - PR 上跑会让 diff 看着像"无故改了 version.properties"
-      #   - release workflow 会显式处理(见 release.yml)
-      - name: Show version diff (informational, do not commit)
-        run: |
-          if git diff --quiet 2fa-android/version.properties; then
-            echo "version.properties unchanged"
-          else
-            echo "::warning::version.properties auto-bumped by gradle, not committing back to source"
-            git diff 2fa-android/version.properties || true
-          fi
-
-      # ── [7] Gradle assembleDebug ─────────────────────────────
+      # ── [8] Gradle assembleDebug ─────────────────────────────
       - name: Build debug APK
         working-directory: 2fa-android
         env:
@@ -144,7 +148,7 @@ jobs:
           GRADLE_OPTS: "-Dorg.gradle.daemon=false"
         run: ./gradlew :app:assembleDebug --no-daemon --stacktrace
 
-      # ── [8] 上传 APK 作为 artifact ───────────────────────────
+      # ── [9] 上传 APK 作为 artifact ───────────────────────────
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
         with:
