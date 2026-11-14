@@ -193,8 +193,10 @@ jobs:
           gradle-home-cache-cleanup: true
 
       # ── [6] 抽 JNA libjnidispatch.so 到 jniLibs ────────────────────
-      # jna jar 不含 Android natives，需从 jna-platform aar 的 jni/<abi>/ 抽出来；
-      # jniLibs 整个目录 gitignore，CI 每次都要做（本地由构建脚本手动抽）。
+      # JNA 的 **jar** 只带桌面 natives；Android natives 在 Maven Central 的
+      # `net.java.dev.jna:jna:<ver>.aar`（`jni/<abi>/libjnidispatch.so`）里，
+      # 不是 `jna-platform`（那个没有 .aar，实测 404）。jniLibs 整个目录 gitignore，
+      # CI 每次都要做（本地由 build-rust-android 脚本/JNA aar 手动抽）。
       - name: Extract JNA libjnidispatch.so
         env:
           JNA_VERSION: "5.14.0"
@@ -204,9 +206,9 @@ jobs:
           JNI_LIBS="2fa-android/app/src/main/jniLibs/$JNA_ABI_DIR"
           mkdir -p "$JNI_LIBS"
           curl -fL --retry 3 \
-            -o /tmp/jna-platform.aar \
-            "https://repo1.maven.org/maven2/net/java/dev/jna/jna-platform/${JNA_VERSION}/jna-platform-${JNA_VERSION}.aar"
-          unzip -j -o /tmp/jna-platform.aar \
+            -o /tmp/jna.aar \
+            "https://repo1.maven.org/maven2/net/java/dev/jna/jna/${JNA_VERSION}/jna-${JNA_VERSION}.aar"
+          unzip -j -o /tmp/jna.aar \
             "jni/${JNA_ABI_DIR}/libjnidispatch.so" \
             -d "$JNI_LIBS"
           ls -la "$JNI_LIBS"

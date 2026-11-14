@@ -39,10 +39,9 @@ kotlinx-coroutines-android = { module = "org.jetbrains.kotlinx:kotlinx-coroutine
 androidx-documentfile = { module = "androidx.documentfile:documentfile", version.ref = "documentfile" }
 
 # UniFFI 0.32 Kotlin binding uses JNA for FFI calls.
-# We extract libjnidispatch.so from the AAR (jni/<abi>/) into app/src/main/jniLibs/
-# because the standard JNA .jar only ships jnidispatch for desktop platforms.
-# See `tools/extract-jna-android.sh` (or PowerShell equivalent) — this needs to
-# be re-run when bumping the JNA version.
+# JNA's `net.java.dev.jna:jna:<ver>.aar` ships Android natives under jni/<abi>/;
+# extract `libjnidispatch.so` into app/src/main/jniLibs/ (the CI workflows do it,
+# and jniLibs is gitignored — re-run when bumping the JNA version).
 net-java-dev-jna = { module = "net.java.dev.jna:jna", version.ref = "jna" }
 
 [plugins]
