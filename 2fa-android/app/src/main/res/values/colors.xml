@@ -1,8 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="dark_slate">#FF1A1B1F</color>
-    <color name="gold_pyramid">#FF007BFF</color>
-    <!-- 启动窗口底色（v2.1）：分别对应 Compose LightScheme/DarkScheme 的 background -->
-    <color name="launch_background_light">#FFFAFBFC</color>
-    <color name="launch_background_dark">#FF0A0D11</color>
+    <!-- 启动器图标底板颜色（Precision Geometry：白底圆角板）。
+         由 mipmap-anydpi-v26/ic_launcher.xml / ic_launcher_round.xml 的 <background> 引用。 -->
+    <color name="launcher_background">#FFFFFFFF</color>
+
+    <!-- 启动窗口 / Android 12 SplashScreen 底色（与 ui/theme/Color.kt 的 LightScheme/DarkScheme
+         background 一致，避免启动白闪；夜间由 values-night/themes.xml 引用 launch_background_dark）。 -->
+    <color name="launch_background_light">#FFF4F2EE</color>
+    <color name="launch_background_dark">#FF1A1815</color>
 </resources>

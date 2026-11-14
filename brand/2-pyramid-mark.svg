@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">2-Pyramid</title>
+  <desc id="desc">Minimal geometric mark for the 2-Pyramid resource pack converter.</desc>
+  <g fill="none" stroke="#111111" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M140 430 L76 286 L430 76 Z" stroke-width="12"/>
+    <path d="M140 430 L282 198" stroke-width="9"/>
+  </g>
+</svg>

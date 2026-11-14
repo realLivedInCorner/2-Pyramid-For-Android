@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="40 40 430 430" role="img" aria-label="2-Pyramid">
+  <g fill="none" stroke="#111111" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M140 430 L76 286 L430 76 Z" stroke-width="20"/>
+    <path d="M140 430 L282 198" stroke-width="16"/>
+  </g>
+</svg>

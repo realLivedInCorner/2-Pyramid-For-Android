@@ -1,11 +1,18 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <style name="Theme.TwoFA" parent="android:Theme.Material.NoActionBar">
-        <item name="android:statusBarColor">@color/dark_slate</item>
-        <item name="android:navigationBarColor">@color/dark_slate</item>
-        <item name="android:windowLightStatusBar">true</item>
-        <!-- 启动窗口底色：与 Compose LightScheme.background 一致，避免浅色主题启动时闪深色。
+        <!-- 启动首帧：状态栏/导航栏与背景同色（暖纸 #F4F2EE），避免启动时闪冷色/白闪。
              深色 system 下由 values-night 覆盖（见 values-night/themes.xml）。 -->
+        <item name="android:statusBarColor">@color/launch_background_light</item>
+        <item name="android:navigationBarColor">@color/launch_background_light</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
         <item name="android:windowBackground">@color/launch_background_light</item>
+
+        <!-- Android 12 SplashScreen（minSdk 31，可直接用 android: 属性）：
+             背景与 windowBackground 同色；图标为日间黑 mark。
+             夜间由 drawable-night/brand_splash.xml 自动覆盖为白 mark（资源名不变）。 -->
+        <item name="android:windowSplashScreenBackground">@color/launch_background_light</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@drawable/brand_splash</item>
     </style>
 </resources>

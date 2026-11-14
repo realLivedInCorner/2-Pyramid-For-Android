@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 由 tools/generate-android-brand.mjs 生成，勿手改。源：brand/2-pyramid-mark.svg（512 画布）映射到 190dp 内容区，居中于 288dp 画布；日间黑 mark，夜间由 drawable-night/brand_splash.xml 覆盖为白 mark。 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="288dp"
+    android:height="288dp"
+    android:viewportWidth="288"
+    android:viewportHeight="288">
+    <group
+        android:scaleX="0.371094"
+        android:scaleY="0.371094"
+        android:translateX="49"
+        android:translateY="49">
+        <path
+            android:pathData="M140 430 L76 286 L430 76 Z"
+            android:fillColor="#00000000"
+            android:strokeColor="#111111"
+            android:strokeWidth="12"
+            android:strokeLineCap="round"
+            android:strokeLineJoin="round" />
+        <path
+            android:pathData="M140 430 L282 198"
+            android:fillColor="#00000000"
+            android:strokeColor="#111111"
+            android:strokeWidth="9"
+            android:strokeLineCap="round"
+            android:strokeLineJoin="round" />
+    </group>
+</vector>

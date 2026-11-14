@@ -1,12 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- system 深色时的启动窗口底色：与 Compose DarkScheme.background 一致，避免深色用户启动白闪。
+    <!-- system 深色时的启动首帧：底色/状态栏/导航栏 = 暖墨 #1A1815，Splash 图标为白 mark
+         （@drawable/brand_splash 在夜间自动解析到 drawable-night/brand_splash.xml）。
          注意：用户手动选 light/dark 且与 system 相反时，启动窗口仍按 system 走一帧（进程启动前无法读取
          SharedPreferences），进 App 后由 MainActivity 的 window.setBackgroundDrawable 立即校正。 -->
     <style name="Theme.TwoFA" parent="android:Theme.Material.NoActionBar">
-        <item name="android:statusBarColor">@color/dark_slate</item>
-        <item name="android:navigationBarColor">@color/dark_slate</item>
+        <item name="android:statusBarColor">@color/launch_background_dark</item>
+        <item name="android:navigationBarColor">@color/launch_background_dark</item>
         <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
         <item name="android:windowBackground">@color/launch_background_dark</item>
+        <item name="android:windowSplashScreenBackground">@color/launch_background_dark</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@drawable/brand_splash</item>
     </style>
 </resources>
